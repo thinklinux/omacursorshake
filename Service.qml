@@ -59,6 +59,7 @@ Item {
   property string currentJob: ""
   property string generation: ""
   property double lastApplyAt: 0
+  readonly property int diagnosticMaxChars: 480
 
   function clampNumber(value, fallback, min, max) {
     var n = Number(value)
@@ -86,6 +87,15 @@ Item {
 
   function settingsJson() {
     return JSON.stringify(normalizeSettings(settings), null, 2)
+  }
+
+  function sanitizeDiagnostic(text) {
+    var s = String(text || "")
+    s = s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+    if (s.length > diagnosticMaxChars)
+      s = "…" + s.substring(s.length - diagnosticMaxChars)
+    return s.trim()
   }
 
   function persistSettings() {
@@ -179,8 +189,8 @@ Item {
       "--app-name", "omacursorshake",
       "-g", "󰍽",
       "-u", "normal",
-      title,
-      body
+      String(title || ""),
+      root.sanitizeDiagnostic(body)
     ])
   }
 
@@ -205,7 +215,7 @@ Item {
 
       if (code !== 0) {
         root.building = false
-        root.lastError = err || (name + " failed")
+        root.lastError = root.sanitizeDiagnostic(err || (name + " failed"))
         root.phase = root.supported ? "error" : "unsupported"
         root.statusText = root.lastError
         if (name === "ensure" || name === "load")

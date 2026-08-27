@@ -127,10 +127,13 @@ Panel {
             Text {
               width: parent.width
               text: root.serviceReady ? root.shakeService.statusText : "Starting…"
+              textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.Wrap
+              maximumLineCount: 4
+              elide: Text.ElideRight
             }
           }
 
@@ -284,10 +287,13 @@ Panel {
           width: parent.width
           visible: root.serviceReady && root.shakeService.lastError !== ""
           text: root.shakeService.lastError
+          textFormat: Text.PlainText
           color: bar ? bar.urgent : Color.urgent
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           wrapMode: Text.Wrap
+          maximumLineCount: 6
+          elide: Text.ElideRight
         }
       }
     }

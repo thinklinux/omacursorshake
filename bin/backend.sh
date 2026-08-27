@@ -13,11 +13,41 @@ SO_PATH="$STATE_DIR/dynamic-cursors.so"
 STAMP_PATH="$STATE_DIR/built-for"
 SETTINGS_PATH="$STATE_DIR/settings.json"
 APPLY_LUA="$STATE_DIR/apply.lua"
+BUILD_LOG="$STATE_DIR/build.log"
 REPO_URL="https://github.com/VirtCode/hypr-dynamic-cursors.git"
+DIAG_BYTES=2048
+CLONE_TIMEOUT=120
+FETCH_TIMEOUT=120
+CHECKOUT_TIMEOUT=30
+MAKE_TIMEOUT=300
 
 fail() {
-  echo "omacursorshake: $*" >&2
+  {
+    printf 'omacursorshake: %s\n' "$*"
+    if [[ -s ${BUILD_LOG:-} ]]; then
+      printf 'omacursorshake: build log tail:\n'
+      tail -c "$DIAG_BYTES" "$BUILD_LOG" || true
+    fi
+  } | tr -d '\000-\010\013\014\016-\037\177' | tail -c "$DIAG_BYTES" >&2
   exit 1
+}
+
+# Run a network/build step with a hard timeout. stdout/stderr stay in BUILD_LOG
+# so Quickshell never buffers unbounded git/make output.
+run_timed() {
+  local secs=$1
+  shift
+  mkdir -p "$STATE_DIR"
+  printf '\n+ [%ss] %s\n' "$secs" "$*" >>"$BUILD_LOG"
+  local code=0
+  timeout --foreground --signal=TERM --kill-after=8 "$secs" "$@" >>"$BUILD_LOG" 2>&1 || code=$?
+  if (( code == 0 )); then
+    return 0
+  fi
+  if (( code == 124 || code == 137 )); then
+    fail "timed out after ${secs}s: $*"
+  fi
+  fail "failed ($code): $*"
 }
 
 hyprland_commit() {
@@ -228,6 +258,7 @@ ensure_tree() {
   command -v git >/dev/null || fail "git is required to fetch hypr-dynamic-cursors"
   command -v make >/dev/null || fail "make is required to build hypr-dynamic-cursors"
   command -v g++ >/dev/null || fail "g++ is required to build hypr-dynamic-cursors"
+  command -v timeout >/dev/null || fail "timeout (coreutils) is required to bound git/make"
   pkg-config --exists hyprland || fail "pkg-config hyprland is missing; install the hyprland package"
 }
 
@@ -248,17 +279,17 @@ cmd_ensure() {
   fi
 
   echo "omacursorshake: building hypr-dynamic-cursors $plugin_rev for Hyprland $hl_commit" >&2
+  : >"$BUILD_LOG"
 
   if [[ ! -d $SRC_DIR/.git ]]; then
     rm -rf "$SRC_DIR"
-    git clone --filter=blob:none --no-checkout "$REPO_URL" "$SRC_DIR" >&2
+    run_timed "$CLONE_TIMEOUT" git clone --filter=blob:none --no-checkout "$REPO_URL" "$SRC_DIR"
   fi
 
-  git -C "$SRC_DIR" remote set-url origin "$REPO_URL" >&2
-  git -C "$SRC_DIR" fetch --force origin "$plugin_rev" >&2
-  git -C "$SRC_DIR" checkout --detach "$plugin_rev" >&2
-
-  make -C "$SRC_DIR" all >&2
+  run_timed "$FETCH_TIMEOUT" git -C "$SRC_DIR" remote set-url origin "$REPO_URL"
+  run_timed "$FETCH_TIMEOUT" git -C "$SRC_DIR" fetch --force origin "$plugin_rev"
+  run_timed "$CHECKOUT_TIMEOUT" git -C "$SRC_DIR" checkout --detach "$plugin_rev"
+  run_timed "$MAKE_TIMEOUT" make -C "$SRC_DIR" all
   [[ -f $SRC_DIR/out/dynamic-cursors.so ]] || fail "build finished but $SRC_DIR/out/dynamic-cursors.so is missing"
 
   if [[ $was_loaded == true ]]; then
