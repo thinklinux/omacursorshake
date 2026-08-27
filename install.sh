@@ -1,6 +1,7 @@
 #!/bin/bash
-# Local install: symlink this folder into Omarchy's plugin directory and enable it.
-# Does not need a git remote. omarchy plugin add is for GitHub later.
+# Local install from a checkout: symlink this folder into Omarchy's plugin
+# directory and enable it. For a published copy, use:
+#   omarchy plugin add https://github.com/thinklinux/omacursorshake.git --enable
 
 set -euo pipefail
 
@@ -11,6 +12,11 @@ DEST="$HOME/.config/omarchy/plugins/$ID"
 omarchy plugin validate "$SRC"
 
 mkdir -p "$HOME/.config/omarchy/plugins"
+# Drop the previous local id if this checkout was renamed.
+if [[ -L $HOME/.config/omarchy/plugins/tvalkanov.omacursorshake ]]; then
+  omarchy plugin disable tvalkanov.omacursorshake >/dev/null 2>&1 || true
+  rm -f "$HOME/.config/omarchy/plugins/tvalkanov.omacursorshake"
+fi
 ln -sfn "$SRC" "$DEST"
 
 omarchy-shell -q shell rescanPlugins || true

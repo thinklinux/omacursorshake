@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "tvalkanov.omacursorshake",
+  "id": "io.github.thinklinux.omacursorshake",
   "name": "Shake to find",
-  "version": "0.1.0",
-  "author": "tvalkanov",
+  "version": "1.0.0",
+  "author": "Tihomir Valkanov",
   "license": "MIT",
-  "description": "Shake the mouse to enlarge the cursor, like macOS. Zoom only — no tilt. Loads hypr-dynamic-cursors at runtime; does not edit hyprland.lua.",
+  "description": "Shake the mouse to enlarge the cursor, like macOS. Zoom only — no tilt.",
   "kinds": ["service", "bar-widget"],
   "entryPoints": {
     "service": "Service.qml",

@@ -6,8 +6,8 @@ import qs.Ui
 // Service.qml so shake-to-find keeps working while this panel is closed.
 Panel {
   id: root
-  moduleName: "tvalkanov.omacursorshake"
-  ipcTarget: "tvalkanov.omacursorshake"
+  moduleName: "io.github.thinklinux.omacursorshake"
+  ipcTarget: "io.github.thinklinux.omacursorshake"
 
   readonly property var shakeService: bar && bar.shell
     ? bar.shell.serviceFor(moduleName)

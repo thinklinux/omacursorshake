@@ -1,32 +1,33 @@
 # Shake to find
 
 Omarchy plugin that magnifies the cursor when you shake the mouse, like
-macOS. It wraps [hypr-dynamic-cursors](https://github.com/VirtCode/hypr-dynamic-cursors)
-and loads it into Hyprland at runtime. Simulation modes (tilt / rotate /
-stretch) are forced off; only shake-to-find zoom is enabled.
+macOS.
+
+![Shake to find settings](preview.png)
+
+It wraps [hypr-dynamic-cursors](https://github.com/VirtCode/hypr-dynamic-cursors)
+and loads that compositor plugin into Hyprland at runtime. Simulation modes
+(tilt / rotate / stretch) are forced off; only shake-to-find zoom is enabled.
 
 It does **not** edit `hyprland.lua` or any other file under `~/.config/hypr/`.
-The compositor plugin is built into the state dir, loaded with `hyprctl`, and
-re-applied after Hyprland config reloads.
+The `.so` is built into `~/.local/state/omarchy/omacursorshake/` and loaded
+with `hyprctl`. Settings are re-applied after Hyprland config reloads.
 
 The Omarchy shell starts every login. This plugin rides that process and
 re-attaches the compositor plugin each session.
 
-## Install (this machine, no GitHub yet)
-
-From this folder:
+## Install
 
 ```bash
-./install.sh
+omarchy plugin add https://github.com/thinklinux/omacursorshake.git --enable
 ```
 
-That validates the manifest, symlinks the folder into
-`~/.config/omarchy/plugins/tvalkanov.omacursorshake`, and enables it on the
-right side of the bar.
+First enable clones and compiles hypr-dynamic-cursors (needs `git`, `make`,
+`g++`, and the Hyprland headers that already ship with Omarchy). No sudo.
+After that, shake the mouse.
 
-First enable clones and compiles `hypr-dynamic-cursors` into
-`~/.local/state/omarchy/omacursorshake/` (needs git, g++, and the hyprland
-headers that already ship with Omarchy). No sudo. After that, shake the mouse.
+From a local checkout you can instead run `./install.sh`, which symlinks this
+folder into `~/.config/omarchy/plugins/` and enables it.
 
 ## Use
 
@@ -37,20 +38,25 @@ The feature stays on while the widget is enabled, even with the panel closed.
 Sensitivity, magnification, hold, and the on/off switch are saved in
 `~/.local/state/omarchy/omacursorshake/settings.json` and restored on login.
 
+Removing the bar widget disables shake detection. Leave the icon on the bar
+if you want it to keep working.
+
 ## Uninstall
 
 ```bash
-omarchy plugin disable tvalkanov.omacursorshake
-rm "$HOME/.config/omarchy/plugins/tvalkanov.omacursorshake"
+omarchy plugin remove io.github.thinklinux.omacursorshake
 ```
 
-The compiled plugin under `~/.local/state/omarchy/omacursorshake/` can be
-deleted too if you want it gone.
+That disables the plugin and deletes the checkout. The compiled
+hypr-dynamic-cursors binary under `~/.local/state/omarchy/omacursorshake/`
+can be deleted too if you want it gone.
 
 ## Limits
 
 - x86_64 only (Hyprland function hooks)
 - A Hyprland update rebuilds the compositor plugin on next login (stamp
-  mismatch). Do not hot-swap the `.so` while Hyprland has it loaded.
-- Removing the bar widget disables shake detection; leave it on the bar, or
-  we can add a plugins[] pin later
+  mismatch). Do not overwrite the mapped `.so` while Hyprland has it loaded.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
