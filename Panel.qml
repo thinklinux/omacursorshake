@@ -166,7 +166,7 @@ Panel {
 
             Text {
               id: sensValue
-              text: Number(root.currentSettings.threshold).toFixed(1)
+              text: Number(root.currentSettings.threshold).toFixed(0)
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -176,21 +176,15 @@ Panel {
             }
           }
 
-          Text {
-            width: parent.width
-            text: "Lower detects a shake sooner"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
           PanelSlider {
             id: sensSlider
             bar: root.bar
             width: parent.width
-            minimum: 2
-            maximum: 12
-            step: 0.5
+            minimum: 4
+            maximum: 8
+            step: 1
+            integer: true
+            tickCount: 5
             value: Number(root.currentSettings.threshold)
             onReleased: function(v) { root.setThreshold(v) }
           }
@@ -217,7 +211,7 @@ Panel {
 
             Text {
               id: magValue
-              text: Number(root.currentSettings.base).toFixed(1) + "×"
+              text: Number(root.currentSettings.base).toFixed(0) + "×"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -231,9 +225,11 @@ Panel {
             id: magSlider
             bar: root.bar
             width: parent.width
-            minimum: 2
-            maximum: 8
-            step: 0.5
+            minimum: 3
+            maximum: 6
+            step: 1
+            integer: true
+            tickCount: 4
             value: Number(root.currentSettings.base)
             onReleased: function(v) { root.setBase(v) }
           }
@@ -274,10 +270,11 @@ Panel {
             id: holdSlider
             bar: root.bar
             width: parent.width
-            minimum: 500
-            maximum: 4000
-            step: 100
+            minimum: 1000
+            maximum: 3000
+            step: 500
             integer: true
+            tickCount: 5
             value: Number(root.currentSettings.timeout)
             onReleased: function(v) { root.setTimeoutMs(v) }
           }

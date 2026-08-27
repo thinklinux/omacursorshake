@@ -68,17 +68,19 @@ Item {
     return n
   }
 
-  function round1(value) {
-    return Math.round(value * 10) / 10
+  function snap(value, fallback, min, max, step) {
+    var n = clampNumber(value, fallback, min, max)
+    var snapped = min + Math.round((n - min) / step) * step
+    return clampNumber(snapped, fallback, min, max)
   }
 
   function normalizeSettings(parsed) {
     var src = parsed && typeof parsed === "object" ? parsed : {}
     return {
       enabled: src.enabled !== false,
-      threshold: round1(clampNumber(src.threshold, 6.0, 2.0, 16.0)),
-      base: round1(clampNumber(src.base, 4.0, 2.0, 10.0)),
-      timeout: Math.round(clampNumber(src.timeout, 2000, 400, 8000))
+      threshold: snap(src.threshold, 6, 4, 8, 1),
+      base: snap(src.base, 4, 3, 6, 1),
+      timeout: Math.round(snap(src.timeout, 2000, 1000, 3000, 500))
     }
   }
 
