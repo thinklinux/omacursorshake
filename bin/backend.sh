@@ -28,15 +28,57 @@ hyprland_version() {
   hyprctl -j version 2>/dev/null | jq -r '.version // empty'
 }
 
+require_commit_sha() {
+  local sha=${1:-}
+  [[ $sha =~ ^[0-9a-f]{40}$ ]] || fail "hypr-dynamic-cursors pin must be a 40-character commit SHA (got: ${sha:-empty})"
+}
+
 # Hyprland commit -> hypr-dynamic-cursors commit (from upstream hyprpm.toml).
+# Unknown Hyprland versions fail; never fall back to a moving branch.
 plugin_rev_for() {
   local hl="${1:-}"
   case "$hl" in
-  efb50993780079460b0cbed1363e2166a2de1d9f) echo "5a224284872208b5324759d535d65061043725de" ;; # 0.56.2
-  5c9377c15f85c50648f35ca5a213754f95b93ca0) echo "f5ba36c7622098b53bf62ddb8ddf03b914abbdf8" ;; # 0.56.1
-  36b2e0cfe0c6094dbc47bd42a437431315bb3087) echo "f5ba36c7622098b53bf62ddb8ddf03b914abbdf8" ;; # 0.56.0
+  918d8340afd652b011b937d29d5eea0be08467f5) echo "f0409be76564171a97a792deabab3bd0528fe40c" ;; # 0.41.2
+  9a09eac79b85c846e3a865a9078a3f8ff65a9259) echo "ddfea3a29c9badf6dabe12be86e4c5ba6d5507ad" ;; # 0.42.0
+  0f594732b063a90d44df8c5d402d658f27471dfe) echo "ddfea3a29c9badf6dabe12be86e4c5ba6d5507ad" ;; # 0.43.0
+  0c7a7e2d569eeed9d6025f3eef4ea0690d90845d) echo "3ff4c2a053f7673b3b8cd45ada0886cbda13ebcc" ;; # 0.44.0
+  4520b30d498daca8079365bdb909a8dea38e8d55) echo "3ff4c2a053f7673b3b8cd45ada0886cbda13ebcc" ;; # 0.44.1
+  a425fbebe4cf4238e48a42f724ef2208959d66cf) echo "81f4b964f997a3174596ef22c7a1dee8a5f616c7" ;; # 0.45.0
+  500d2a3580388afc8b620b0a3624147faa34f98b) echo "81f4b964f997a3174596ef22c7a1dee8a5f616c7" ;; # 0.45.1
+  12f9a0d0b93f691d4d9923716557154d74777b0a) echo "81f4b964f997a3174596ef22c7a1dee8a5f616c7" ;; # 0.45.2
+  788ae588979c2a1ff8a660f16e3c502ef5796755) echo "111669a699f998b5eb5a0d5610b5fcb748aab038" ;; # 0.46.0
+  254fc2bc6000075f660b4b8ed818a6af544d1d64) echo "111669a699f998b5eb5a0d5610b5fcb748aab038" ;; # 0.46.1
+  0bd541f2fd902dbfa04c3ea2ccf679395e316887) echo "111669a699f998b5eb5a0d5610b5fcb748aab038" ;; # 0.46.2
+  04ac46c54357278fc68f0a95d26347ea0db99496) echo "261bc1668f7de45b48ba6a40d5d727025575390b" ;; # 0.47.0
+  75dff7205f6d2bd437abfb4196f700abee92581a) echo "261bc1668f7de45b48ba6a40d5d727025575390b" ;; # 0.47.1
+  882f7ad7d2bbfc7440d0ccaef93b1cdd78e8e3ff) echo "261bc1668f7de45b48ba6a40d5d727025575390b" ;; # 0.47.2
+  5ee35f914f921e5696030698e74fb5566a804768) echo "9f40dc905e5b7e00f0c00956a5c2b007b26c50c2" ;; # 0.48.0
+  29e2e59fdbab8ed2cc23a20e3c6043d5decb5cdc) echo "2e7ea0224d8de63bb3ffead40e44248321b349bc" ;; # 0.48.1
+  9958d297641b5c84dcff93f9039d80a5ad37ab00) echo "0e0e58ca95a58ea44896558409e0a151e7013fc0" ;; # 0.49.0
+  c4a4c341568944bd4fb9cd503558b2de602c0213) echo "d6eb0b798c9b07f7f866647c8eb1d75a930501be" ;; # 0.50.0
+  4e242d086e20b32951fdc0ebcbfb4d41b5be8dcc) echo "d6eb0b798c9b07f7f866647c8eb1d75a930501be" ;; # 0.50.1
+  46174f78b374b6cea669c48880877a8bdcf7802f) echo "acac1f9a5c896ba934af1fc2414670c752ae529d" ;; # 0.51.0
+  71a1216abcc7031776630a6d88f105605c4dc1c9) echo "acac1f9a5c896ba934af1fc2414670c752ae529d" ;; # 0.51.1
+  f56ec180d3a03a5aa978391249ff8f40f949fb73) echo "8c1679b87c54e97145cae83e622956d720e88bef" ;; # 0.52.0
+  967c3c7404d4fa00234e29c70df3e263386d2597) echo "8c1679b87c54e97145cae83e622956d720e88bef" ;; # 0.52.1
+  386376400119dd46a767c9f8c8791fd22c7b6e61) echo "8c1679b87c54e97145cae83e622956d720e88bef" ;; # 0.52.2
+  ea444c35bb23b6e34505ab6753e069de7801cc25) echo "7e9b7bc9fbcbb2f7f8985ec1f435b43021609639" ;; # 0.53.0
+  ab1d80f3d6aebd57a0971b53a1993b1c1dfe0b09) echo "7e9b7bc9fbcbb2f7f8985ec1f435b43021609639" ;; # 0.53.1
+  39f3feddbee4a66be9608ed1eb7e73878d596b50) echo "7e9b7bc9fbcbb2f7f8985ec1f435b43021609639" ;; # 0.53.2
+  dd220efe7b1e292415bd0ea7161f63df9c95bfd3) echo "7e9b7bc9fbcbb2f7f8985ec1f435b43021609639" ;; # 0.53.3
+  0002f148c9a4fe421a9d33c0faa5528cdc411e62) echo "57e14edd0ae265b01828e466e287e96eb1e84dd3" ;; # 0.54.0
+  4b07770b9ef1cceb2e6f56d33538aaffb9186b9c) echo "57e14edd0ae265b01828e466e287e96eb1e84dd3" ;; # 0.54.1
+  59f9f2688ac508a0584d1462151195a6c4992f99) echo "57e14edd0ae265b01828e466e287e96eb1e84dd3" ;; # 0.54.2
+  521ece463c4a9d3d128670688a34756805a4328f) echo "57e14edd0ae265b01828e466e287e96eb1e84dd3" ;; # 0.54.3
+  af923e30d1d24f1f4a4f5cb8308065173c1d9539) echo "d195ab3ce94b0c983e04569a613361bff72be3d7" ;; # 0.55.0
+  a47147bc095e5b3be3eb8bd04f0ac242b968cd4d) echo "da447486c84e0be81f2cdd208af1ef92469f0a88" ;; # 0.55.1
+  39d7e209c79d451efab1b21151d5938289da838d) echo "da447486c84e0be81f2cdd208af1ef92469f0a88" ;; # 0.55.2
+  fe5fe79a29ac3adaf3e75560b2f4b7a6d58b31c9) echo "da447486c84e0be81f2cdd208af1ef92469f0a88" ;; # 0.55.3
   a0136d8c04687bb36eb8a28eb9d1ff92aea99704) echo "da447486c84e0be81f2cdd208af1ef92469f0a88" ;; # 0.55.4
-  *) echo "main" ;;
+  36b2e0cfe0c6094dbc47bd42a437431315bb3087) echo "f5ba36c7622098b53bf62ddb8ddf03b914abbdf8" ;; # 0.56.0
+  5c9377c15f85c50648f35ca5a213754f95b93ca0) echo "f5ba36c7622098b53bf62ddb8ddf03b914abbdf8" ;; # 0.56.1
+  efb50993780079460b0cbed1363e2166a2de1d9f) echo "5a224284872208b5324759d535d65061043725de" ;; # 0.56.2
+  *) echo "" ;;
   esac
 }
 
@@ -196,6 +238,8 @@ cmd_ensure() {
   hl_commit=$(hyprland_commit)
   [[ -n $hl_commit ]] || fail "could not read Hyprland version (is hyprctl available?)"
   plugin_rev=$(plugin_rev_for "$hl_commit")
+  [[ -n $plugin_rev ]] || fail "no pinned hypr-dynamic-cursors commit for Hyprland $hl_commit ($(hyprland_version))"
+  require_commit_sha "$plugin_rev"
   plugin_loaded && was_loaded=true
 
   if (( force == 0 )) && [[ -f $SO_PATH && -f $STAMP_PATH && $(<"$STAMP_PATH") == "$hl_commit" ]]; then
@@ -203,19 +247,16 @@ cmd_ensure() {
     return 0
   fi
 
-  echo "omacursorshake: building hypr-dynamic-cursors ($plugin_rev) for Hyprland $hl_commit" >&2
+  echo "omacursorshake: building hypr-dynamic-cursors $plugin_rev for Hyprland $hl_commit" >&2
 
   if [[ ! -d $SRC_DIR/.git ]]; then
     rm -rf "$SRC_DIR"
-    git clone --filter=blob:none "$REPO_URL" "$SRC_DIR" >&2
+    git clone --filter=blob:none --no-checkout "$REPO_URL" "$SRC_DIR" >&2
   fi
 
   git -C "$SRC_DIR" remote set-url origin "$REPO_URL" >&2
-  git -C "$SRC_DIR" fetch --tags --force origin >&2
-  if ! git -C "$SRC_DIR" checkout --force "$plugin_rev" >&2; then
-    git -C "$SRC_DIR" fetch origin "$plugin_rev" >&2
-    git -C "$SRC_DIR" checkout --force FETCH_HEAD >&2
-  fi
+  git -C "$SRC_DIR" fetch --force origin "$plugin_rev" >&2
+  git -C "$SRC_DIR" checkout --detach "$plugin_rev" >&2
 
   make -C "$SRC_DIR" all >&2
   [[ -f $SRC_DIR/out/dynamic-cursors.so ]] || fail "build finished but $SRC_DIR/out/dynamic-cursors.so is missing"

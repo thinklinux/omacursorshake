@@ -54,6 +54,8 @@ can be deleted too if you want it gone.
 ## Limits
 
 - x86_64 only (Hyprland function hooks)
+- hypr-dynamic-cursors is fetched at a pinned commit for the running Hyprland
+  version. Unsupported Hyprland versions fail instead of building `main`.
 - A Hyprland update rebuilds the compositor plugin on next login (stamp
   mismatch). Do not overwrite the mapped `.so` while Hyprland has it loaded.
 
