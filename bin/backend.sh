@@ -6,6 +6,8 @@
 set -euo pipefail
 export GIT_TERMINAL_PROMPT=0
 
+HERE=$(cd "$(dirname "$0")" && pwd)
+STATEIO="$HERE/stateio.py"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 STATE_DIR="$STATE_HOME/omarchy/omacursorshake"
 SRC_DIR="$STATE_DIR/src"
@@ -25,40 +27,29 @@ MAKE_TIMEOUT=300
 fail() {
   {
     printf 'omacursorshake: %s\n' "$*"
-    if [[ -s ${BUILD_LOG:-} ]]; then
+    if [[ -n ${BUILD_LOG:-} ]]; then
       printf 'omacursorshake: build log tail:\n'
-      tail -c "$DIAG_BYTES" "$BUILD_LOG" || true
+      python3 "$STATEIO" read "$BUILD_LOG" "$DIAG_BYTES" 2>/dev/null || true
     fi
   } | tr -d '\000-\010\013\014\016-\037\177' | tail -c "$DIAG_BYTES" >&2
   exit 1
 }
 
-# Keep only the last LOG_BUDGET bytes on disk while reading stdin.
-# Exit 2 if the stream exceeded the budget (fail closed).
+ensure_state_dir() {
+  python3 "$STATEIO" ensure-dir "$STATE_DIR"
+}
+
+secure_read() {
+  python3 "$STATEIO" read "$1" "${2:-65536}"
+}
+
+secure_write() {
+  local dest=$1 mode=${2:-0600}
+  python3 "$STATEIO" write "$dest" "$mode"
+}
+
 cap_output_ring() {
-  python3 -c '
-import sys
-budget = int(sys.argv[1])
-dest = sys.argv[2]
-buf = bytearray()
-total = 0
-with open(dest, "wb") as out:
-    while True:
-        chunk = sys.stdin.buffer.read(8192)
-        if not chunk:
-            break
-        total += len(chunk)
-        buf.extend(chunk)
-        if len(buf) > budget:
-            del buf[:len(buf) - budget]
-        out.seek(0)
-        out.write(buf)
-        out.truncate()
-        out.flush()
-        if total > budget:
-            sys.exit(2)
-sys.exit(0)
-' "$LOG_BUDGET" "$1"
+  python3 "$STATEIO" write-ring "$1" "$LOG_BUDGET"
 }
 
 # Timeout plus a hard on-disk byte ceiling. The log file never grows past
@@ -66,8 +57,7 @@ sys.exit(0)
 run_timed() {
   local secs=$1
   shift
-  mkdir -p "$STATE_DIR"
-  : >"$BUILD_LOG"
+  ensure_state_dir
   local tcode=0 capcode=0
   set +e
   timeout --foreground --signal=TERM --kill-after=8 "$secs" "$@" 2>&1 \
@@ -169,11 +159,8 @@ plugin_loaded() {
 # Replace the directory entry, never truncate a mapped inode.
 install_so() {
   local src=$1
-  local tmp
-  tmp=$(mktemp -p "$(dirname "$SO_PATH")" ".dynamic-cursors.so.XXXXXX")
-  cp -f "$src" "$tmp"
-  chmod 755 "$tmp"
-  mv -f "$tmp" "$SO_PATH"
+  ensure_state_dir
+  secure_write "$SO_PATH" 0755 <"$src"
 }
 
 # QML FileView writes are async; jobs pass a JSON snapshot as $2 so disable
@@ -181,19 +168,20 @@ install_so() {
 ingest_settings_json() {
   local raw=${1:-}
   [[ -n $raw ]] || return 0
-  mkdir -p "$STATE_DIR"
+  ensure_state_dir
   jq -e 'type == "object"' <<<"$raw" >/dev/null || fail "settings JSON is invalid"
-  printf '%s\n' "$raw" >"$SETTINGS_PATH"
+  printf '%s\n' "$raw" | secure_write "$SETTINGS_PATH"
 }
 
 write_apply_lua() {
-  mkdir -p "$STATE_DIR"
-  local enabled threshold base timeout
-  if [[ -f $SETTINGS_PATH ]]; then
-    enabled=$(jq -r 'if .enabled == false then "false" else "true" end' "$SETTINGS_PATH")
-    threshold=$(jq -r '.threshold // 6.0' "$SETTINGS_PATH")
-    base=$(jq -r '.base // 4.0' "$SETTINGS_PATH")
-    timeout=$(jq -r '.timeout // 2000' "$SETTINGS_PATH")
+  ensure_state_dir
+  local enabled threshold base timeout raw
+  raw=$(secure_read "$SETTINGS_PATH" 65536 || true)
+  if [[ -n $raw ]]; then
+    enabled=$(jq -r 'if .enabled == false then "false" else "true" end' <<<"$raw")
+    threshold=$(jq -r '.threshold // 6.0' <<<"$raw")
+    base=$(jq -r '.base // 4.0' <<<"$raw")
+    timeout=$(jq -r '.timeout // 2000' <<<"$raw")
   else
     enabled=true
     threshold=6.0
@@ -210,7 +198,8 @@ write_apply_lua() {
   # not the live mode. Shape rules override mode immediately on the next
   # setShape (any cursor change). Apply them for every protocol shape plus
   # Hyprland's wallpaper name so nothing keeps the default "tilt".
-  cat >"$APPLY_LUA" <<EOF
+  local lua
+  lua=$(cat <<EOF
 if hl.plugin.dynamic_cursors then
   hl.config({
     plugin = {
@@ -240,6 +229,8 @@ if hl.plugin.dynamic_cursors then
   end
 end
 EOF
+)
+  printf '%s\n' "$lua" | secure_write "$APPLY_LUA"
 }
 
 eval_apply() {
@@ -248,15 +239,15 @@ eval_apply() {
 }
 
 cmd_status() {
-  mkdir -p "$STATE_DIR"
+  ensure_state_dir
   local arch hl_commit hl_ver built loaded so_exists needs
   arch=$(uname -m)
   hl_commit=$(hyprland_commit)
   hl_ver=$(hyprland_version)
-  built=""
-  [[ -f $STAMP_PATH ]] && built=$(<"$STAMP_PATH")
+  built=$(secure_read "$STAMP_PATH" 128 || true)
+  built=${built//$'\n'/}
   so_exists=false
-  [[ -f $SO_PATH ]] && so_exists=true
+  python3 "$STATEIO" exists "$SO_PATH" && so_exists=true
   loaded=false
   plugin_loaded && loaded=true
   needs=false
@@ -293,7 +284,7 @@ cmd_status() {
 }
 
 ensure_tree() {
-  mkdir -p "$STATE_DIR"
+  ensure_state_dir
   [[ $(uname -m) == x86_64 ]] || fail "hypr-dynamic-cursors only works on x86_64 (Hyprland function hooks)"
   command -v git >/dev/null || fail "git is required to fetch hypr-dynamic-cursors"
   command -v make >/dev/null || fail "make is required to build hypr-dynamic-cursors"
@@ -314,17 +305,27 @@ cmd_ensure() {
   require_commit_sha "$plugin_rev"
   plugin_loaded && was_loaded=true
 
-  if (( force == 0 )) && [[ -f $SO_PATH && -f $STAMP_PATH && $(<"$STAMP_PATH") == "$hl_commit" ]]; then
+  local built_for=""
+  built_for=$(secure_read "$STAMP_PATH" 128 || true)
+  built_for=${built_for//$'\n'/}
+  if (( force == 0 )) && python3 "$STATEIO" exists "$SO_PATH" && [[ $built_for == "$hl_commit" ]]; then
     cmd_status
     return 0
   fi
 
   echo "omacursorshake: building hypr-dynamic-cursors $plugin_rev for Hyprland $hl_commit" >&2
-  : >"$BUILD_LOG"
 
-  if [[ ! -d $SRC_DIR/.git ]]; then
-    rm -rf "$SRC_DIR"
+  local need_clone=1
+  if [[ -e $SRC_DIR ]]; then
+    python3 "$STATEIO" ensure-dir "$SRC_DIR"
+    if [[ -d $SRC_DIR/.git ]]; then
+      need_clone=0
+    fi
+  fi
+  if (( need_clone == 1 )); then
+    python3 "$STATEIO" rm-tree "$SRC_DIR"
     run_timed "$CLONE_TIMEOUT" git clone --filter=blob:none --no-checkout "$REPO_URL" "$SRC_DIR"
+    python3 "$STATEIO" ensure-dir "$SRC_DIR"
   fi
 
   run_timed "$FETCH_TIMEOUT" git -C "$SRC_DIR" remote set-url origin "$REPO_URL"
@@ -337,13 +338,13 @@ cmd_ensure() {
     echo "omacursorshake: plugin is loaded; installing beside the mapped inode" >&2
   fi
   install_so "$SRC_DIR/out/dynamic-cursors.so"
-  printf '%s\n' "$hl_commit" >"$STAMP_PATH"
+  printf '%s\n' "$hl_commit" | secure_write "$STAMP_PATH"
   cmd_status
 }
 
 cmd_load() {
   ingest_settings_json "${1:-}"
-  [[ -f $SO_PATH ]] || fail "plugin is not built yet"
+  python3 "$STATEIO" exists "$SO_PATH" || fail "plugin is not built yet"
   if plugin_loaded; then
     eval_apply || true
     cmd_status
@@ -387,13 +388,13 @@ cmd_apply() {
 
 cmd_save() {
   ingest_settings_json "${1:-}"
-  [[ -f $SETTINGS_PATH ]] || fail "no settings to save"
+  python3 "$STATEIO" exists "$SETTINGS_PATH" || fail "no settings to save"
   cmd_status
 }
 
 cmd_claim() {
-  mkdir -p "$STATE_DIR"
-  printf '%s\n' "${1:-}" >"$STATE_DIR/owner"
+  ensure_state_dir
+  printf '%s\n' "${1:-}" | secure_write "$STATE_DIR/owner"
 }
 
 cmd_unload_if() {

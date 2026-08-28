@@ -256,7 +256,7 @@ Item {
 
   Process {
     id: settingsReader
-    command: ["bash", "-c", "head -c 65536 -- \"$0\" 2>/dev/null || true", root.settingsPath]
+    command: ["python3", root.pluginDir + "bin/stateio.py", "read", root.settingsPath, "65536"]
     stdout: StdioCollector { id: settingsOut; waitForEnd: true }
     onExited: function() {
       var text = String(settingsOut.text || "").trim()
