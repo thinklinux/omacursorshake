@@ -16,6 +16,7 @@ APPLY_LUA="$STATE_DIR/apply.lua"
 BUILD_LOG="$STATE_DIR/build.log"
 REPO_URL="https://github.com/VirtCode/hypr-dynamic-cursors.git"
 DIAG_BYTES=2048
+LOG_BUDGET=65536
 CLONE_TIMEOUT=120
 FETCH_TIMEOUT=120
 CHECKOUT_TIMEOUT=30
@@ -32,22 +33,61 @@ fail() {
   exit 1
 }
 
-# Run a network/build step with a hard timeout. stdout/stderr stay in BUILD_LOG
-# so Quickshell never buffers unbounded git/make output.
+# Keep only the last LOG_BUDGET bytes on disk while reading stdin.
+# Exit 2 if the stream exceeded the budget (fail closed).
+cap_output_ring() {
+  python3 -c '
+import sys
+budget = int(sys.argv[1])
+dest = sys.argv[2]
+buf = bytearray()
+total = 0
+with open(dest, "wb") as out:
+    while True:
+        chunk = sys.stdin.buffer.read(8192)
+        if not chunk:
+            break
+        total += len(chunk)
+        buf.extend(chunk)
+        if len(buf) > budget:
+            del buf[:len(buf) - budget]
+        out.seek(0)
+        out.write(buf)
+        out.truncate()
+        out.flush()
+        if total > budget:
+            sys.exit(2)
+sys.exit(0)
+' "$LOG_BUDGET" "$1"
+}
+
+# Timeout plus a hard on-disk byte ceiling. The log file never grows past
+# LOG_BUDGET while git/make run; extra output fails the phase.
 run_timed() {
   local secs=$1
   shift
   mkdir -p "$STATE_DIR"
-  printf '\n+ [%ss] %s\n' "$secs" "$*" >>"$BUILD_LOG"
-  local code=0
-  timeout --foreground --signal=TERM --kill-after=8 "$secs" "$@" >>"$BUILD_LOG" 2>&1 || code=$?
-  if (( code == 0 )); then
+  : >"$BUILD_LOG"
+  local tcode=0 capcode=0
+  set +e
+  timeout --foreground --signal=TERM --kill-after=8 "$secs" "$@" 2>&1 \
+    | cap_output_ring "$BUILD_LOG"
+  tcode=${PIPESTATUS[0]}
+  capcode=${PIPESTATUS[1]}
+  set -e
+  if (( capcode == 2 )); then
+    fail "output exceeded ${LOG_BUDGET}-byte budget: $*"
+  fi
+  if (( capcode != 0 )); then
+    fail "failed to capture output ($capcode): $*"
+  fi
+  if (( tcode == 0 )); then
     return 0
   fi
-  if (( code == 124 || code == 137 )); then
+  if (( tcode == 124 || tcode == 137 )); then
     fail "timed out after ${secs}s: $*"
   fi
-  fail "failed ($code): $*"
+  fail "failed ($tcode): $*"
 }
 
 hyprland_commit() {
@@ -259,6 +299,7 @@ ensure_tree() {
   command -v make >/dev/null || fail "make is required to build hypr-dynamic-cursors"
   command -v g++ >/dev/null || fail "g++ is required to build hypr-dynamic-cursors"
   command -v timeout >/dev/null || fail "timeout (coreutils) is required to bound git/make"
+  command -v python3 >/dev/null || fail "python3 is required to cap build-log size"
   pkg-config --exists hyprland || fail "pkg-config hyprland is missing; install the hyprland package"
 }
 
