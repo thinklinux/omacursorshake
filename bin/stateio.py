@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Secure I/O for omacursorshake state files.
 
-Every path component is lstat'd; directories are opened with
-O_NOFOLLOW|O_DIRECTORY. Predictable files are read with
-O_NOFOLLOW|O_NONBLOCK and the descriptor is fstat'd. Writes use an
-O_EXCL temporary created in the already-opened destination directory,
-held open through write, fsync, and rename, then the directory is
-fsynced. Recursive removal walks already-open no-follow directory
-descriptors, unlinks with dir_fd, and refuses mount or identity changes.
+Every path component is opened with O_NOFOLLOW|O_DIRECTORY from `/`.
+The final directory descriptor from that walk is kept and used for
+reads, writes, ring captures, copies, existence checks, and recursive
+removal. Full pathnames are never reopened after the walk. Files are
+opened with O_NOFOLLOW|O_NONBLOCK via dir_fd and fstat'd. Writes use an
+O_EXCL temporary in the already-opened directory, held open through
+write, fsync, and rename. Removal unlinks with dir_fd and refuses mount
+or identity changes.
 """
 
 from __future__ import annotations
@@ -42,6 +43,14 @@ def dir_names(path: str) -> list[str]:
     return names
 
 
+def split_leaf(path: str) -> tuple[str, str]:
+    path = os.path.abspath(path)
+    parent, name = os.path.dirname(path), os.path.basename(path)
+    if not name or name in (".", ".."):
+        fail(f"invalid path: {path}")
+    return parent, name
+
+
 def map_open_error(exc: OSError, path: str) -> None:
     if exc.errno in (errno.ELOOP, errno.EMLINK):
         fail(f"refusing to follow symlink: {path}")
@@ -56,13 +65,10 @@ def lstat_at(dirfd: int | None, name: str) -> os.stat_result:
     return os.lstat(name, dir_fd=dirfd)
 
 
-def openat_dir(dirfd: int | None, name: str, label: str, *, missing_ok: bool = False) -> int:
+def openat_dir(dirfd: int, name: str, label: str, *, missing_ok: bool = False) -> int:
     flags = os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW | CLOEXEC
     try:
-        if dirfd is None:
-            fd = os.open(name, flags)
-        else:
-            fd = os.open(name, flags, dir_fd=dirfd)
+        fd = os.open(name, flags, dir_fd=dirfd)
     except FileNotFoundError:
         if missing_ok:
             raise
@@ -82,10 +88,6 @@ def openat_dir(dirfd: int | None, name: str, label: str, *, missing_ok: bool = F
     return fd
 
 
-def open_dir_nofollow(path: str) -> int:
-    return openat_dir(None, os.path.abspath(path), path)
-
-
 def mkdirat_nofollow(dirfd: int, name: str, label: str) -> None:
     try:
         os.mkdir(name, 0o700, dir_fd=dirfd)
@@ -95,7 +97,8 @@ def mkdirat_nofollow(dirfd: int, name: str, label: str) -> None:
         fail(f"mkdir failed ({exc.strerror}): {label}")
 
 
-def ensure_dir(path: str) -> None:
+def walk_dir(path: str, *, create: bool = False) -> int:
+    """Open path component-by-component with O_NOFOLLOW. Caller owns the fd."""
     path = os.path.abspath(path)
     names = dir_names(path)
     if not names:
@@ -108,21 +111,40 @@ def ensure_dir(path: str) -> None:
             try:
                 nextfd = openat_dir(dirfd, name, walked, missing_ok=True)
             except FileNotFoundError:
+                if not create:
+                    raise
                 mkdirat_nofollow(dirfd, name, walked)
                 nextfd = openat_dir(dirfd, name, walked)
             os.close(dirfd)
             dirfd = nextfd
         st = os.fstat(dirfd)
+        if not stat.S_ISDIR(st.st_mode):
+            fail(f"not a directory: {path}")
         if st.st_uid != os.getuid():
             fail(f"directory not owned by current user: {path}")
-        os.fchmod(dirfd, 0o700)
-        st2 = os.fstat(dirfd)
-        if not stat.S_ISDIR(st2.st_mode) or st2.st_uid != os.getuid():
-            fail(f"directory mutated during setup: {path}")
-        if (st2.st_mode & 0o777) != 0o700:
-            fail(f"directory mode mutated during setup: {path}")
-    finally:
+        if create:
+            os.fchmod(dirfd, 0o700)
+            st2 = os.fstat(dirfd)
+            if not stat.S_ISDIR(st2.st_mode) or st2.st_uid != os.getuid():
+                fail(f"directory mutated during setup: {path}")
+            if (st2.st_mode & 0o777) != 0o700:
+                fail(f"directory mode mutated during setup: {path}")
+        return dirfd
+    except Exception:
         os.close(dirfd)
+        raise
+
+
+def open_dir_walk(path: str) -> int:
+    return walk_dir(path, create=False)
+
+
+def ensure_dir_fd(path: str) -> int:
+    return walk_dir(path, create=True)
+
+
+def ensure_dir(path: str) -> None:
+    os.close(ensure_dir_fd(path))
 
 
 def validate_reg_fd(fd: int, path: str) -> os.stat_result:
@@ -134,37 +156,55 @@ def validate_reg_fd(fd: int, path: str) -> os.stat_result:
     return st
 
 
-def secure_open_read(path: str) -> int:
+def valid_dirent_name(name: str) -> None:
+    if not name or name in (".", "..") or "/" in name or name in (os.sep, os.pardir):
+        fail(f"invalid directory entry: {name}")
+
+
+def open_reg_at(dirfd: int, name: str, label: str) -> int:
+    valid_dirent_name(name)
     flags = os.O_RDONLY | NOFOLLOW | NONBLOCK | CLOEXEC
     try:
-        fd = os.open(path, flags)
+        fd = os.open(name, flags, dir_fd=dirfd)
     except FileNotFoundError:
         raise
     except OSError as exc:
-        map_open_error(exc, path)
+        map_open_error(exc, label)
     try:
-        validate_reg_fd(fd, path)
+        validate_reg_fd(fd, label)
     except SystemExit:
         os.close(fd)
         raise
     return fd
 
 
+def read_fd(fd: int, max_bytes: int) -> bytes:
+    data = b""
+    while len(data) < max_bytes:
+        chunk = os.read(fd, min(8192, max_bytes - len(data)))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
 def read_file(path: str, max_bytes: int) -> bytes:
+    parent, name = split_leaf(path)
     try:
-        fd = secure_open_read(path)
+        dirfd = walk_dir(parent, create=False)
     except FileNotFoundError:
         return b""
     try:
-        data = b""
-        while len(data) < max_bytes:
-            chunk = os.read(fd, min(8192, max_bytes - len(data)))
-            if not chunk:
-                break
-            data += chunk
-        return data
+        try:
+            fd = open_reg_at(dirfd, name, path)
+        except FileNotFoundError:
+            return b""
+        try:
+            return read_fd(fd, max_bytes)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(dirfd)
 
 
 def mkstemp_in_dir(dirfd: int, mode: int) -> tuple[int, str]:
@@ -205,29 +245,22 @@ def publish_held_fd(dirfd: int, fd: int, tmp_name: str, dest_name: str, dest: st
         fail(f"published file invalid: {dest}")
 
 
-def write_file(path: str, data: bytes, mode: int = 0o600) -> None:
-    path = os.path.abspath(path)
-    dir_path = os.path.dirname(path)
-    dest_name = os.path.basename(path)
-    if not dest_name or dest_name in (".", ".."):
-        fail(f"invalid destination: {path}")
-    ensure_dir(dir_path)
-    dirfd = open_dir_nofollow(dir_path)
+def write_through_dirfd(dirfd: int, dest_name: str, dest: str, data: bytes, mode: int) -> None:
+    st = os.fstat(dirfd)
+    if st.st_uid != os.getuid():
+        fail(f"directory not owned by current user: {dest}")
     fd = -1
     tmp_name = ""
     try:
-        st = os.fstat(dirfd)
-        if st.st_uid != os.getuid():
-            fail(f"directory not owned by current user: {dir_path}")
         fd, tmp_name = mkstemp_in_dir(dirfd, mode)
         offset = 0
         while offset < len(data):
             offset += os.write(fd, data[offset:])
         os.ftruncate(fd, len(data))
-        publish_held_fd(dirfd, fd, tmp_name, dest_name, path)
+        publish_held_fd(dirfd, fd, tmp_name, dest_name, dest)
         tmp_name = ""
     except OSError as exc:
-        fail(f"write failed ({exc.strerror}): {path}")
+        fail(f"write failed ({exc.strerror}): {dest}")
     finally:
         if fd >= 0:
             os.close(fd)
@@ -238,24 +271,27 @@ def write_file(path: str, data: bytes, mode: int = 0o600) -> None:
                 pass
             except OSError:
                 pass
+
+
+def write_file(path: str, data: bytes, mode: int = 0o600) -> None:
+    parent, dest_name = split_leaf(path)
+    dirfd = ensure_dir_fd(parent)
+    try:
+        write_through_dirfd(dirfd, dest_name, path, data, mode)
+    finally:
         os.close(dirfd)
 
 
 def write_ring_from_stdin(path: str, budget: int) -> int:
-    path = os.path.abspath(path)
-    dir_path = os.path.dirname(path)
-    dest_name = os.path.basename(path)
-    if not dest_name or dest_name in (".", ".."):
-        fail(f"invalid destination: {path}")
-    ensure_dir(dir_path)
-    dirfd = open_dir_nofollow(dir_path)
+    parent, dest_name = split_leaf(path)
+    dirfd = ensure_dir_fd(parent)
     fd = -1
     tmp_name = ""
     exceeded = False
     try:
         st = os.fstat(dirfd)
         if st.st_uid != os.getuid():
-            fail(f"directory not owned by current user: {dir_path}")
+            fail(f"directory not owned by current user: {parent}")
         fd, tmp_name = mkstemp_in_dir(dirfd, 0o600)
         buf = bytearray()
         total = 0
@@ -295,37 +331,54 @@ def write_ring_from_stdin(path: str, budget: int) -> int:
 
 
 def copy_file(src: str, dest: str, mode: int) -> None:
+    src_parent, src_name = split_leaf(src)
     try:
-        fd = secure_open_read(src)
+        src_dirfd = walk_dir(src_parent, create=False)
     except FileNotFoundError:
         fail(f"missing file: {src}")
     try:
-        data = b""
-        while True:
-            chunk = os.read(fd, 8192)
-            if not chunk:
-                break
-            data += chunk
-            if len(data) > MAX_COPY:
-                fail(f"file exceeds {MAX_COPY}-byte copy limit: {src}")
+        try:
+            fd = open_reg_at(src_dirfd, src_name, src)
+        except FileNotFoundError:
+            fail(f"missing file: {src}")
+        try:
+            data = read_fd(fd, MAX_COPY + 1)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(src_dirfd)
+    if len(data) > MAX_COPY:
+        fail(f"file exceeds {MAX_COPY}-byte copy limit: {src}")
     write_file(dest, data, mode)
 
 
 def exists_reg(path: str) -> bool:
+    parent, name = split_leaf(path)
     try:
-        st = os.lstat(path)
+        dirfd = walk_dir(parent, create=False)
     except FileNotFoundError:
         return False
+    try:
+        st = os.lstat(name, dir_fd=dirfd)
+    except FileNotFoundError:
+        return False
+    finally:
+        os.close(dirfd)
     return stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
 
 
 def exists_dir(path: str) -> bool:
+    parent, name = split_leaf(path)
     try:
-        st = os.lstat(path)
+        dirfd = walk_dir(parent, create=False)
     except FileNotFoundError:
         return False
+    try:
+        st = os.lstat(name, dir_fd=dirfd)
+    except FileNotFoundError:
+        return False
+    finally:
+        os.close(dirfd)
     return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid()
 
 
@@ -340,33 +393,6 @@ def assert_dir_ident(fd: int, expected: tuple[int, int, int], label: str) -> os.
     if dir_ident(st) != expected:
         fail(f"directory identity changed during removal: {label}")
     return st
-
-
-def open_dir_walk(path: str) -> int:
-    path = os.path.abspath(path)
-    names = dir_names(path)
-    dirfd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | CLOEXEC)
-    walked = ""
-    try:
-        for name in names:
-            walked = walked + "/" + name
-            nextfd = openat_dir(dirfd, name, walked, missing_ok=True)
-            os.close(dirfd)
-            dirfd = nextfd
-        st = os.fstat(dirfd)
-        if not stat.S_ISDIR(st.st_mode):
-            fail(f"not a directory: {path}")
-        if names and st.st_uid != os.getuid():
-            fail(f"directory not owned by current user: {path}")
-        return dirfd
-    except Exception:
-        os.close(dirfd)
-        raise
-
-
-def valid_dirent_name(name: str) -> None:
-    if not name or name in (".", "..") or "/" in name or name in (os.sep, os.pardir):
-        fail(f"invalid directory entry: {name}")
 
 
 def remove_dir_contents(
@@ -471,7 +497,7 @@ def remove_entry(
 def remove_tree_in(root: str, name: str) -> None:
     valid_dirent_name(name)
     try:
-        rootfd = open_dir_walk(root)
+        rootfd = walk_dir(root, create=False)
     except FileNotFoundError:
         return
     try:
