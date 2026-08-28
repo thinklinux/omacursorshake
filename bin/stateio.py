@@ -6,7 +6,8 @@ O_NOFOLLOW|O_DIRECTORY. Predictable files are read with
 O_NOFOLLOW|O_NONBLOCK and the descriptor is fstat'd. Writes use an
 O_EXCL temporary created in the already-opened destination directory,
 held open through write, fsync, and rename, then the directory is
-fsynced.
+fsynced. Recursive removal walks already-open no-follow directory
+descriptors, unlinks with dir_fd, and refuses mount or identity changes.
 """
 
 from __future__ import annotations
@@ -328,21 +329,169 @@ def exists_dir(path: str) -> bool:
     return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid()
 
 
-def remove_tree(path: str) -> None:
+def dir_ident(st: os.stat_result) -> tuple[int, int, int]:
+    return (st.st_dev, st.st_ino, st.st_uid)
+
+
+def assert_dir_ident(fd: int, expected: tuple[int, int, int], label: str) -> os.stat_result:
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        fail(f"not a directory: {label}")
+    if dir_ident(st) != expected:
+        fail(f"directory identity changed during removal: {label}")
+    return st
+
+
+def open_dir_walk(path: str) -> int:
+    path = os.path.abspath(path)
+    names = dir_names(path)
+    dirfd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | CLOEXEC)
+    walked = ""
     try:
-        st = os.lstat(path)
+        for name in names:
+            walked = walked + "/" + name
+            nextfd = openat_dir(dirfd, name, walked, missing_ok=True)
+            os.close(dirfd)
+            dirfd = nextfd
+        st = os.fstat(dirfd)
+        if not stat.S_ISDIR(st.st_mode):
+            fail(f"not a directory: {path}")
+        if names and st.st_uid != os.getuid():
+            fail(f"directory not owned by current user: {path}")
+        return dirfd
+    except Exception:
+        os.close(dirfd)
+        raise
+
+
+def valid_dirent_name(name: str) -> None:
+    if not name or name in (".", "..") or "/" in name or name in (os.sep, os.pardir):
+        fail(f"invalid directory entry: {name}")
+
+
+def remove_dir_contents(
+    dirfd: int,
+    dir_expected: tuple[int, int, int],
+    rootfd: int,
+    root_expected: tuple[int, int, int],
+    root_dev: int,
+    label: str,
+) -> None:
+    assert_dir_ident(rootfd, root_expected, "state directory")
+    assert_dir_ident(dirfd, dir_expected, label)
+    for name in os.listdir(dirfd):
+        valid_dirent_name(name)
+        remove_entry(dirfd, name, dir_expected, rootfd, root_expected, root_dev, f"{label}/{name}")
+        assert_dir_ident(rootfd, root_expected, "state directory")
+        assert_dir_ident(dirfd, dir_expected, label)
+
+
+def remove_entry(
+    parentfd: int,
+    name: str,
+    parent_expected: tuple[int, int, int],
+    rootfd: int,
+    root_expected: tuple[int, int, int],
+    root_dev: int,
+    label: str,
+) -> None:
+    valid_dirent_name(name)
+    assert_dir_ident(rootfd, root_expected, "state directory")
+    assert_dir_ident(parentfd, parent_expected, os.path.dirname(label) or ".")
+
+    try:
+        lst = os.lstat(name, dir_fd=parentfd)
     except FileNotFoundError:
         return
-    if stat.S_ISLNK(st.st_mode) or stat.S_ISREG(st.st_mode):
-        os.unlink(path)
+
+    if lst.st_dev != root_dev:
+        fail(f"refusing to cross mount boundary: {label}")
+
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW | CLOEXEC
+    file_flags = os.O_RDONLY | NOFOLLOW | NONBLOCK | CLOEXEC
+
+    if stat.S_ISLNK(lst.st_mode):
+        os.unlink(name, dir_fd=parentfd)
         return
-    if not stat.S_ISDIR(st.st_mode):
-        fail(f"refusing to remove special file: {path}")
-    if st.st_uid != os.getuid():
-        fail(f"refusing to remove directory not owned by current user: {path}")
-    for name in os.listdir(path):
-        remove_tree(os.path.join(path, name))
-    os.rmdir(path)
+
+    if stat.S_ISDIR(lst.st_mode):
+        try:
+            childfd = os.open(name, dir_flags, dir_fd=parentfd)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+                fail(f"directory entry mutated during removal: {label}")
+            map_open_error(exc, label)
+        try:
+            cst = os.fstat(childfd)
+            if not stat.S_ISDIR(cst.st_mode):
+                fail(f"not a directory: {label}")
+            if cst.st_uid != os.getuid():
+                fail(f"directory not owned by current user: {label}")
+            if cst.st_dev != root_dev:
+                fail(f"refusing to cross mount boundary: {label}")
+            if cst.st_ino != lst.st_ino or cst.st_dev != lst.st_dev:
+                fail(f"entry identity changed during removal: {label}")
+            child_expected = dir_ident(cst)
+            remove_dir_contents(childfd, child_expected, rootfd, root_expected, root_dev, label)
+            assert_dir_ident(childfd, child_expected, label)
+        finally:
+            os.close(childfd)
+        try:
+            os.rmdir(name, dir_fd=parentfd)
+        except OSError as exc:
+            fail(f"rmdir failed ({exc.strerror}): {label}")
+        return
+
+    try:
+        fd = os.open(name, file_flags, dir_fd=parentfd)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            fail(f"entry mutated into a symlink during removal: {label}")
+        map_open_error(exc, label)
+    try:
+        fst = os.fstat(fd)
+        if stat.S_ISDIR(fst.st_mode):
+            fail(f"entry identity changed during removal: {label}")
+        if fst.st_uid != os.getuid():
+            fail(f"file not owned by current user: {label}")
+        if fst.st_dev != root_dev:
+            fail(f"refusing to cross mount boundary: {label}")
+        if fst.st_ino != lst.st_ino or fst.st_dev != lst.st_dev:
+            fail(f"entry identity changed during removal: {label}")
+    finally:
+        os.close(fd)
+    try:
+        os.unlink(name, dir_fd=parentfd)
+    except OSError as exc:
+        fail(f"unlink failed ({exc.strerror}): {label}")
+
+
+def remove_tree_in(root: str, name: str) -> None:
+    valid_dirent_name(name)
+    try:
+        rootfd = open_dir_walk(root)
+    except FileNotFoundError:
+        return
+    try:
+        root_st = os.fstat(rootfd)
+        if not stat.S_ISDIR(root_st.st_mode):
+            fail(f"not a directory: {root}")
+        if root_st.st_uid != os.getuid():
+            fail(f"directory not owned by current user: {root}")
+        root_expected = dir_ident(root_st)
+        remove_entry(rootfd, name, root_expected, rootfd, root_expected, root_st.st_dev, name)
+        assert_dir_ident(rootfd, root_expected, root)
+    except OSError as exc:
+        fail(f"remove failed ({exc.strerror}): {root}/{name}")
+    finally:
+        os.close(rootfd)
+
+
+def remove_tree(path: str) -> None:
+    path = os.path.abspath(path)
+    remove_tree_in(os.path.dirname(path), os.path.basename(path))
 
 
 def main(argv: list[str]) -> int:
@@ -387,10 +536,13 @@ def main(argv: list[str]) -> int:
             fail("stateio is-dir <path>")
         return 0 if exists_dir(argv[2]) else 1
     if cmd == "rm-tree":
-        if len(argv) != 3:
-            fail("stateio rm-tree <path>")
-        remove_tree(argv[2])
-        return 0
+        if len(argv) == 3:
+            remove_tree(argv[2])
+            return 0
+        if len(argv) == 4:
+            remove_tree_in(argv[2], argv[3])
+            return 0
+        fail("stateio rm-tree <path> | rm-tree <state-dir> <name>")
     fail(f"stateio: unknown command {cmd}")
     return 1
 

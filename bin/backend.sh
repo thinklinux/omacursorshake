@@ -358,7 +358,7 @@ cmd_ensure() {
     fi
   fi
   if (( need_clone == 1 )); then
-    python3 "$STATEIO" rm-tree "$SRC_DIR"
+    python3 "$STATEIO" rm-tree "$STATE_DIR" src
     run_timed "$CLONE_TIMEOUT" git clone --filter=blob:none --no-checkout "$REPO_URL" "$SRC_DIR"
     python3 "$STATEIO" ensure-dir "$SRC_DIR"
   fi
