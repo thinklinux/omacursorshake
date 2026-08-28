@@ -157,10 +157,12 @@ plugin_loaded() {
 }
 
 # Replace the directory entry, never truncate a mapped inode.
+# The compiler output is a predictable path: read it without following
+# a symlink, then publish the bytes through a same-directory temporary.
 install_so() {
   local src=$1
   ensure_state_dir
-  secure_write "$SO_PATH" 0755 <"$src"
+  python3 "$STATEIO" copy "$src" "$SO_PATH" 0755
 }
 
 # QML FileView writes are async; jobs pass a JSON snapshot as $2 so disable
@@ -194,10 +196,11 @@ write_apply_lua() {
   [[ $base =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "settings.base must be a number"
   [[ $timeout =~ ^[0-9]+$ ]] || fail "settings.timeout must be an integer"
 
-  # mode is a cached variant on the plugin: hl.config() updates the store but
-  # not the live mode. Shape rules override mode immediately on the next
-  # setShape (any cursor change). Apply them for every protocol shape plus
-  # Hyprland's wallpaper name so nothing keeps the default "tilt".
+  # Default simulation mode is tilt. hl.config() updates the Hyprlang store
+  # but CVariantProp keeps the live MODE until activate() (setShape or a
+  # config reload). Shape rules force mode=none (and zero tilt) on every
+  # protocol/xcursor name Hyprland actually uses, including wallpaper
+  # left_ptr. eval_apply then reloads the cursor so activate() runs now.
   local lua
   lua=$(cat <<EOF
 if hl.plugin.dynamic_cursors then
@@ -206,6 +209,8 @@ if hl.plugin.dynamic_cursors then
       dynamic_cursors = {
         enabled = ${enabled},
         mode = "none",
+        tilt = { full = 0 },
+        rotate = { length = 0 },
         shake = {
           enabled = ${enabled},
           threshold = ${threshold},
@@ -223,9 +228,21 @@ if hl.plugin.dynamic_cursors then
     "e-resize", "n-resize", "ne-resize", "nw-resize", "s-resize", "se-resize",
     "sw-resize", "w-resize", "ew-resize", "ns-resize", "nesw-resize",
     "nwse-resize", "col-resize", "row-resize", "all-scroll", "zoom-in", "zoom-out",
+    "X_cursor", "xterm", "hand1", "hand2", "watch", "fleur", "pirate",
+    "sb_h_double_arrow", "sb_v_double_arrow", "sb_left_arrow", "sb_right_arrow",
+    "sb_up_arrow", "sb_down_arrow", "top_left_corner", "top_right_corner",
+    "bottom_left_corner", "bottom_right_corner", "left_side", "right_side",
+    "top_side", "bottom_side", "sizing", "circle", "plus", "pencil",
+    "cross", "crossed_circle", "dnd-move", "dnd-copy", "dnd-link", "dnd-none",
+    "dnd-no-drop", "center_ptr", "arrow", "right_ptr",
   }
   for _, s in ipairs(shapes) do
-    hl.plugin.dynamic_cursors.shape_rule { shape = s, mode = "none" }
+    hl.plugin.dynamic_cursors.shape_rule {
+      shape = s,
+      mode = "none",
+      tilt = { full = 0 },
+      rotate = { length = 0 },
+    }
   end
 end
 EOF
@@ -233,9 +250,27 @@ EOF
   printf '%s\n' "$lua" | secure_write "$APPLY_LUA"
 }
 
+# Reload the cursor manager so dynamic-cursors activate() runs against the
+# rules we just published. Without this, mode stays at the default "tilt"
+# until the pointer happens to change shape.
+force_cursor_activate() {
+  local theme size
+  theme=${HYPRCURSOR_THEME:-${XCURSOR_THEME:-}}
+  if [[ -z $theme || $theme == default ]]; then
+    theme=$(gsettings get org.gnome.desktop.interface cursor-theme 2>/dev/null | tr -d "'" || true)
+  fi
+  if [[ -z $theme || $theme == default ]]; then
+    theme=Adwaita
+  fi
+  size=${HYPRCURSOR_SIZE:-${XCURSOR_SIZE:-24}}
+  [[ $size =~ ^[0-9]+$ ]] || size=24
+  hyprctl setcursor "$theme" "$size" >&2 || true
+}
+
 eval_apply() {
   write_apply_lua
   hyprctl eval "dofile([[$APPLY_LUA]])" >&2
+  force_cursor_activate
 }
 
 cmd_status() {
@@ -316,9 +351,9 @@ cmd_ensure() {
   echo "omacursorshake: building hypr-dynamic-cursors $plugin_rev for Hyprland $hl_commit" >&2
 
   local need_clone=1
-  if [[ -e $SRC_DIR ]]; then
+  if python3 "$STATEIO" is-dir "$SRC_DIR"; then
     python3 "$STATEIO" ensure-dir "$SRC_DIR"
-    if [[ -d $SRC_DIR/.git ]]; then
+    if python3 "$STATEIO" is-dir "$SRC_DIR/.git"; then
       need_clone=0
     fi
   fi
@@ -332,7 +367,8 @@ cmd_ensure() {
   run_timed "$FETCH_TIMEOUT" git -C "$SRC_DIR" fetch --force origin "$plugin_rev"
   run_timed "$CHECKOUT_TIMEOUT" git -C "$SRC_DIR" checkout --detach "$plugin_rev"
   run_timed "$MAKE_TIMEOUT" make -C "$SRC_DIR" all
-  [[ -f $SRC_DIR/out/dynamic-cursors.so ]] || fail "build finished but $SRC_DIR/out/dynamic-cursors.so is missing"
+  python3 "$STATEIO" exists "$SRC_DIR/out/dynamic-cursors.so" \
+    || fail "build finished but $SRC_DIR/out/dynamic-cursors.so is missing or not a regular file"
 
   if [[ $was_loaded == true ]]; then
     echo "omacursorshake: plugin is loaded; installing beside the mapped inode" >&2
