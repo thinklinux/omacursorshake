@@ -611,27 +611,95 @@ def test_checkout_must_match_the_pin(tmp: Path) -> None:
     assert_true(b"not clean" in proc.stderr, f"err: {proc.stderr!r}")
 
 
-def test_load_honours_hyprctl_exit_status(tmp: Path) -> None:
-    """A failed load must fail even though the name matcher is all we have."""
+def _load_stub(tmp: Path, listed_after: str, load_exit: int) -> dict[str, str]:
+    """hyprctl stub whose plugin list changes once a load has been attempted.
+
+    That transition is the whole point: the old code re-checked the listing
+    after a failed load, saw a name match appear, and called it success.
+    """
     body = (
         "#!/bin/sh\n"
         "case \"$*\" in\n"
         "  *version*) printf '{\"commit\":\"efb50993780079460b0cbed1363e2166a2de1d9f\"}\\n' ;;\n"
-        "  *'plugin list'*) printf '[]\\n' ;;\n"
-        "  *'plugin load'*) echo 'could not load'; exit 1 ;;\n"
+        "  *'plugin list'*)\n"
+        "    if [ -f \"$STUB_LOADED\" ]; then printf '%s\\n' \"$STUB_LISTED_AFTER\"\n"
+        "    else printf '[]\\n'; fi ;;\n"
+        f"  *'plugin load'*) touch \"$STUB_LOADED\"; exit {load_exit} ;;\n"
         "  *) printf 'ok\\n' ;;\n"
         "esac\n"
     )
-    env = _hyprctl_stub(tmp / "load", body)
+    env = _hyprctl_stub(tmp, body)
+    env["STUB_LOADED"] = str(tmp / "loaded-flag")
+    env["STUB_LISTED_AFTER"] = listed_after
     state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
     state.mkdir(parents=True)
     (state / "dynamic-cursors.so").write_bytes(b"ELF-STUB\n")
-    proc = subprocess.run(
+    return env
+
+
+def _run_load(env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
         ["bash", str(BACKEND), "load", '{"enabled":true}'],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
     )
+
+
+def test_load_requires_hyprctl_exit_status(tmp: Path) -> None:
+    """A failed load must fail even when a name match appears afterwards.
+
+    Hyprland 0.56 reports no plugin path, so the listing can only ever be a
+    name match. It must never stand in for hyprctl's own exit status.
+    """
+    env = _load_stub(tmp / "rc", '[{"name":"dynamic-cursors"}]', load_exit=1)
+    env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
+    proc = _run_load(env)
     assert_true(proc.returncode != 0, "load succeeded despite hyprctl failing")
     assert_true(b"plugin load failed" in proc.stderr, f"err: {proc.stderr!r}")
+    assert_true(
+        b'"loaded": true' not in proc.stdout,
+        f"reported loaded after a failed load: {proc.stdout!r}",
+    )
+
+
+def test_foreign_plugin_is_not_claimed_as_ours(tmp: Path) -> None:
+    """A name match we did not load must not gate, or stand in for, our load."""
+    env = _load_stub(tmp / "foreign", "[]", load_exit=0)
+    env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
+    # Something matching is already loaded before we do anything, and no
+    # record of our own load exists for this instance.
+    Path(env["STUB_LOADED"]).touch()
+    env["STUB_LISTED_AFTER"] = '[{"name":"dynamic-cursors"}]'
+    proc = _run_load(env)
+    assert_true(proc.returncode != 0, "a foreign plugin was claimed as ours")
+    assert_true(b"cannot prove is ours" in proc.stderr, f"err: {proc.stderr!r}")
+
+
+def test_confirmed_load_is_recorded_per_instance(tmp: Path) -> None:
+    """The happy path still works, and the proof is scoped to one instance."""
+    env = _load_stub(tmp / "ok", '[{"name":"dynamic-cursors"}]', load_exit=0)
+    env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
+    proc = _run_load(env)
+    assert_true(proc.returncode == 0, f"load failed: {proc.stderr!r}")
+    assert_true(b'"loaded": true' in proc.stdout, f"status: {proc.stdout!r}")
+
+    state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
+    assert_true(
+        (state / "loaded-in").read_text().strip() == "test_instance",
+        "load was not recorded against the compositor instance",
+    )
+
+    # A compositor restart changes the signature, so the record stops being
+    # evidence and the same listing is no longer proof of our load.
+    env["HYPRLAND_INSTANCE_SIGNATURE"] = "other_instance"
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "status"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode == 0, f"status failed: {proc.stderr!r}")
+    assert_true(
+        b'"loaded": false' in proc.stdout,
+        f"stale record survived a compositor restart: {proc.stdout!r}",
+    )
 
 
 def test_cursor_theme_option_injection_refused(tmp: Path) -> None:
@@ -647,6 +715,13 @@ def test_cursor_theme_option_injection_refused(tmp: Path) -> None:
     )
     env = _hyprctl_stub(tmp / "theme", body)
     env["HYPRCURSOR_THEME"] = "--evil-option"
+    # apply only evals into a plugin it can prove is ours, and the listing
+    # carries no path, so record a load for this instance first. Without it
+    # the run stops at write_apply_lua and never reaches setcursor.
+    env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
+    state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "loaded-in").write_text("test_instance\n")
     proc = subprocess.run(
         ["bash", str(BACKEND), "apply", '{"enabled":true}'],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
@@ -690,7 +765,9 @@ def main() -> int:
         test_gnumakefile_precedence_is_defeated,
         test_planted_source_tree_is_destroyed,
         test_checkout_must_match_the_pin,
-        test_load_honours_hyprctl_exit_status,
+        test_load_requires_hyprctl_exit_status,
+        test_foreign_plugin_is_not_claimed_as_ours,
+        test_confirmed_load_is_recorded_per_instance,
         test_cursor_theme_option_injection_refused,
         test_watchdog_and_installer_guards,
     ]

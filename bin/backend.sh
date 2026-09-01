@@ -16,6 +16,7 @@ STAMP_PATH="$STATE_DIR/built-for"
 SETTINGS_PATH="$STATE_DIR/settings.json"
 APPLY_LUA="$STATE_DIR/apply.lua"
 BUILD_LOG="$STATE_DIR/build.log"
+LOADED_IN_PATH="$STATE_DIR/loaded-in"
 REPO_URL="https://github.com/VirtCode/hypr-dynamic-cursors.git"
 # Config keys that make git execute a command on our behalf. The source tree
 # is re-cloned from scratch on every build so a planted .git cannot reach
@@ -207,6 +208,30 @@ hyprland_version() {
   hyprland_field .version 128
 }
 
+# Identity of the running compositor instance. A recorded load is evidence
+# only for the instance it happened in: a Hyprland restart drops every loaded
+# plugin, and the signature changes with it, so a stale record stops matching
+# on its own and needs no cleanup.
+hyprland_instance() {
+  local sig="${HYPRLAND_INSTANCE_SIGNATURE:-}"
+  if [[ -z $sig ]]; then
+    # hyprctl itself falls back to the runtime directory when the variable is
+    # missing. Only an unambiguous single instance counts; anything else stays
+    # empty and leaves the load unproven.
+    local runtime="${XDG_RUNTIME_DIR:-}" dir="" count=0
+    if [[ -n $runtime && -d $runtime/hypr ]]; then
+      for dir in "$runtime"/hypr/*/; do
+        [[ -d $dir ]] || continue
+        count=$((count + 1))
+        dir=${dir%/}
+        sig=${dir##*/}
+      done
+      (( count == 1 )) || sig=""
+    fi
+  fi
+  sanitize_field "$sig" 128
+}
+
 require_commit_sha() {
   local sha=${1:-}
   [[ $sha =~ ^[0-9a-f]{40}$ ]] || fail "hypr-dynamic-cursors pin must be a 40-character commit SHA (got: ${sha:-empty})"
@@ -261,25 +286,69 @@ plugin_rev_for() {
   esac
 }
 
-# Piped straight into jq: no shell variable holds the response. Empty input
-# (no compositor, timeout, byte ceiling hit) makes jq -e exit non-zero, which
-# is the "not loaded" answer we want.
+recorded_instance() {
+  local v=""
+  v=$(secure_read "$LOADED_IN_PATH" 256 2>/dev/null || true)
+  sanitize_field "${v//$'\n'/}" 128
+}
+
+# Remember that *we* loaded the .so, and into which compositor instance.
+record_load() {
+  ensure_state_dir
+  printf '%s\n' "$(hyprland_instance)" | secure_write "$LOADED_IN_PATH"
+}
+
+# Three-valued, because the truth is three-valued:
 #
-# When the compositor reports a path, match on that and ignore names entirely.
-# Hyprland 0.56 reports only name/author/handle/version, so in practice the
-# name branch runs; callers that need proof of *our* load must not treat this
-# as sufficient on its own (see cmd_load).
-plugin_loaded() {
-  hyprctl_capture "$IPC_MAX_BYTES" -j plugin list \
-    | jq -e --arg so "$SO_PATH" '
+#   mine    - proven ours: the compositor reports a path that is our .so, or a
+#             name matches and we recorded a confirmed load in this same
+#             compositor instance.
+#   unknown - something matching is loaded, but nothing proves it is ours.
+#   none    - nothing matching is loaded.
+#
+# Hyprland 0.56 reports only name/author/handle/version, so the path branch is
+# unreachable there and a bare name match cannot tell our .so from an hyprpm
+# install of the same upstream plugin. A name match alone must therefore never
+# resolve to "mine" -- that is what let a failed load report success.
+#
+# Piped straight into jq: no shell variable holds the response. Empty input (no
+# compositor, timeout, byte ceiling hit) yields "none", so callers fail closed.
+plugin_state() {
+  local listed="" inst=""
+  listed=$(hyprctl_capture "$IPC_MAX_BYTES" -j plugin list \
+    | jq -r --arg so "$SO_PATH" '
     def entries: if type == "array" then .[] elif type == "object" then . else empty end;
     def pathof: (.path // .filename // "") | tostring;
     def nameof: (.name // .plugin // .handle // "") | tostring;
-    if [entries | select(pathof != "")] | length > 0
-    then any(entries; pathof | contains($so))
-    else any(entries; nameof | test("dynamic-cursors"; "i"))
+    if any(entries; pathof != "" and (pathof | contains($so))) then "mine"
+    elif any(entries; nameof | test("dynamic-cursors"; "i")) then "unknown"
+    else "none"
     end
-  ' >/dev/null 2>&1
+  ' 2>/dev/null || true)
+  listed=$(sanitize_field "$listed" 16)
+  case "$listed" in
+  mine) printf 'mine\n' ;;
+  unknown)
+    inst=$(hyprland_instance)
+    if [[ -n $inst && $inst == "$(recorded_instance)" ]]; then
+      printf 'mine\n'
+    else
+      printf 'unknown\n'
+    fi
+    ;;
+  *) printf 'none\n' ;;
+  esac
+}
+
+# Proven ours. Gate every action that assumes we own the loaded plugin.
+plugin_is_mine() {
+  [[ $(plugin_state) == mine ]]
+}
+
+# Anything matching is loaded, ours or not. Only for decisions that must be
+# conservative about a possibly-mapped .so.
+plugin_present() {
+  [[ $(plugin_state) != none ]]
 }
 
 # Replace the directory entry, never truncate a mapped inode.
@@ -418,7 +487,9 @@ cmd_status() {
   so_exists=false
   python3 "$STATEIO" exists "$SO_PATH" && so_exists=true
   loaded=false
-  plugin_loaded && loaded=true
+  # Only a proven-ours plugin counts as loaded. "unknown" is reported as false
+  # rather than dressed up as success.
+  plugin_is_mine && loaded=true
   needs=false
   if [[ $arch != x86_64 ]]; then
     needs=false
@@ -485,7 +556,8 @@ cmd_ensure() {
   plugin_rev=$(plugin_rev_for "$hl_commit")
   [[ -n $plugin_rev ]] || fail "no pinned hypr-dynamic-cursors commit for Hyprland $hl_commit ($(hyprland_version))"
   require_commit_sha "$plugin_rev"
-  plugin_loaded && was_loaded=true
+  # Conservative on purpose: any matching plugin may have our .so mapped.
+  plugin_present && was_loaded=true
 
   local built_for=""
   built_for=$(secure_read "$STAMP_PATH" 128 || true)
@@ -525,17 +597,33 @@ cmd_ensure() {
 cmd_load() {
   ingest_settings_json "${1:-}"
   python3 "$STATEIO" exists "$SO_PATH" || fail "plugin is not built yet"
-  if ! plugin_loaded; then
+
+  local state=""
+  state=$(plugin_state)
+
+  if [[ $state == unknown ]]; then
+    # Refuse rather than guess. Loading a second copy would be rejected by the
+    # compositor, and pushing our config into someone else's plugin would make
+    # us a confused deputy for a build we never verified.
+    fail "a dynamic-cursors plugin is already loaded that we cannot prove is ours; remove the other copy (hyprpm remove hypr-dynamic-cursors) and retry"
+  fi
+
+  if [[ $state == none ]]; then
     local load_rc=0
     run_diag hyprctl plugin load "$SO_PATH" || load_rc=$?
-    # Two independent signals. hyprctl's own exit status says the request
-    # succeeded; the plugin list says something matching is loaded. On
-    # Hyprland 0.56 the list carries no path, so the name match alone is weak
-    # evidence and must not stand in for the exit status.
-    plugin_loaded || fail "hyprctl plugin load failed (exit ${load_rc})"
-    (( load_rc == 0 )) \
-      || emit_diag "omacursorshake: hyprctl exited ${load_rc} but a matching plugin is listed"
+    # hyprctl's exit status is the only signal that proves *our* load: the
+    # listing carries no path on current Hyprland, so a name match cannot
+    # distinguish our .so from anyone else's. It is a hard gate, not a hint.
+    (( load_rc == 0 )) || fail "hyprctl plugin load failed (exit ${load_rc})"
+    record_load
+    # Second, independent signal: the compositor must now actually list it.
+    plugin_present || fail "hyprctl reported success but no matching plugin is listed"
+    # The load is confirmed either way; only the durable ownership record needs
+    # an instance identity. Say so plainly instead of reporting a false load
+    # failure, or worse, claiming a load we cannot stand behind later.
+    plugin_is_mine || emit_diag "omacursorshake: loaded, but this compositor instance has no identity (HYPRLAND_INSTANCE_SIGNATURE unset); status will keep reporting not-loaded"
   fi
+
   eval_apply || true
   cmd_status
 }
@@ -543,7 +631,8 @@ cmd_load() {
 cmd_unload() {
   ingest_settings_json "${1:-}"
   # Never hyprctl plugin unload while Hyprland is running. Disable via config.
-  if plugin_loaded; then
+  # Only eval into a plugin we own; otherwise just publish the file.
+  if plugin_is_mine; then
     eval_apply
   else
     write_apply_lua
@@ -553,7 +642,7 @@ cmd_unload() {
 
 cmd_apply() {
   ingest_settings_json "${1:-}"
-  if plugin_loaded; then
+  if plugin_is_mine; then
     eval_apply
   else
     write_apply_lua
