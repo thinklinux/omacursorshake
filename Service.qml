@@ -98,10 +98,6 @@ Item {
     return s.trim()
   }
 
-  function persistSettings() {
-    Quickshell.execDetached(["bash", backend, "save", settingsJson()])
-  }
-
   function updateSettings(patch) {
     var merged = normalizeSettings(settings)
     for (var key in patch) {
@@ -109,7 +105,9 @@ Item {
         merged[key] = patch[key]
     }
     settings = normalizeSettings(merged)
-    persistSettings()
+    // The queued job carries the JSON and persists it backend-side. Writing
+    // it here too would race that job for settings.json and could also land
+    // out of order, leaving the file disagreeing with the compositor.
     if (settings.enabled) enqueue("apply")
     else enqueue("disable")
   }
@@ -224,6 +222,7 @@ Item {
         return
       }
 
+      root.lastError = ""
       root.ingestStatus(out)
 
       if (name === "ensure") {

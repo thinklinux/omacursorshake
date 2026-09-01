@@ -17,16 +17,20 @@ and refuses mount or identity changes.
 from __future__ import annotations
 
 import errno
+import fcntl
 import os
 import secrets
 import stat
 import sys
+import time
 
 CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 NOFOLLOW = os.O_NOFOLLOW
 NONBLOCK = os.O_NONBLOCK
 MAX_COPY = 32 * 1024 * 1024
 MAX_REMOVE_DEPTH = 64
+LOCK_PREFIX = ".lock."
+LOCK_WAIT_SECONDS = 10.0
 GROUP_OTHER_WRITE = stat.S_IWGRP | stat.S_IWOTH
 
 
@@ -251,6 +255,41 @@ def read_tail(path: str, max_bytes: int) -> bytes:
         os.close(dirfd)
 
 
+def acquire_publish_lock(dirfd: int, dest_name: str, dest: str) -> int:
+    """Serialize publishes to one destination name.
+
+    Without this, two of our own processes writing the same state file race:
+    both rename their temporary over the destination and the loser's
+    post-rename inode check fires, which is indistinguishable from an
+    attacker swapping the entry. Locking keeps that check meaningful.
+    """
+    valid_dirent_name(dest_name)
+    name = LOCK_PREFIX + dest_name
+    flags = os.O_RDWR | os.O_CREAT | NOFOLLOW | CLOEXEC
+    try:
+        fd = os.open(name, flags, 0o600, dir_fd=dirfd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            fail(f"refusing to follow symlink lock file: {dest}")
+        fail(f"lock open failed ({exc.strerror}): {dest}")
+    try:
+        validate_reg_fd(fd, f"{LOCK_PREFIX}{dest_name}")
+        deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError as exc:
+                if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    fail(f"lock failed ({exc.strerror}): {dest}")
+                if time.monotonic() >= deadline:
+                    fail(f"timed out after {LOCK_WAIT_SECONDS:.0f}s waiting to publish: {dest}")
+                time.sleep(0.02)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def mkstemp_in_dir(dirfd: int, mode: int) -> tuple[int, str]:
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC
     for _ in range(128):
@@ -293,6 +332,7 @@ def write_through_dirfd(dirfd: int, dest_name: str, dest: str, data: bytes, mode
     st = os.fstat(dirfd)
     if st.st_uid != os.getuid():
         fail(f"directory not owned by current user: {dest}")
+    lockfd = acquire_publish_lock(dirfd, dest_name, dest)
     fd = -1
     tmp_name = ""
     try:
@@ -315,6 +355,7 @@ def write_through_dirfd(dirfd: int, dest_name: str, dest: str, data: bytes, mode
                 pass
             except OSError:
                 pass
+        os.close(lockfd)
 
 
 def write_file(path: str, data: bytes, mode: int = 0o600) -> None:
@@ -330,12 +371,14 @@ def write_ring_from_stdin(path: str, budget: int) -> int:
     parent, dest_name = split_leaf(path)
     dirfd = ensure_dir_fd(parent)
     fd = -1
+    lockfd = -1
     tmp_name = ""
     exceeded = False
     try:
         st = os.fstat(dirfd)
         if st.st_uid != os.getuid():
             fail(f"directory not owned by current user: {parent}")
+        lockfd = acquire_publish_lock(dirfd, dest_name, path)
         fd, tmp_name = mkstemp_in_dir(dirfd, 0o600)
         buf = bytearray()
         total = 0
@@ -370,6 +413,8 @@ def write_ring_from_stdin(path: str, budget: int) -> int:
                 pass
             except OSError:
                 pass
+        if lockfd >= 0:
+            os.close(lockfd)
         os.close(dirfd)
     return 2 if exceeded else 0
 

@@ -305,6 +305,64 @@ def test_backend_refuses_unsafe_state_path(tmp: Path) -> None:
     assert_true("dofile([==[" in src, "safe dofile bracket missing")
 
 
+def test_concurrent_publish_no_inode_mismatch(tmp: Path) -> None:
+    """Our own concurrent writers must queue, not trip the publish check."""
+    state = tmp / "state"
+    state.mkdir(mode=0o700)
+    dest = state / "settings.json"
+    results: list[subprocess.CompletedProcess[bytes]] = []
+    lock = threading.Lock()
+
+    def writer(n: int) -> None:
+        payload = ('{"enabled":false,"threshold":%d}\n' % n).encode()
+        proc = run(["write", str(dest)], stdin=payload, check=False)
+        with lock:
+            results.append(proc)
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for proc in results:
+        assert_true(b"inode mismatch" not in proc.stderr, f"raced publish: {proc.stderr!r}")
+        assert_true(proc.returncode == 0, f"write failed: {proc.stderr!r}")
+    text = dest.read_text()
+    assert_true(text.startswith('{"enabled":false,') and text.endswith("}\n"), f"torn: {text!r}")
+
+
+def test_publish_lock_times_out(tmp: Path) -> None:
+    """A held lock fails closed with a clear message instead of racing."""
+    state = tmp / "state"
+    state.mkdir(mode=0o700)
+    dest = state / "settings.json"
+    held = open(state / (stateio.LOCK_PREFIX + "settings.json"), "wb")
+    original = stateio.LOCK_WAIT_SECONDS
+    stateio.LOCK_WAIT_SECONDS = 0.2
+    try:
+        import fcntl
+
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        start = time.monotonic()
+        try:
+            stateio.write_file(str(dest), b"{}\n")
+            raise Fail("write published while the lock was held")
+        except SystemExit:
+            pass
+        assert_true(time.monotonic() - start < 5, "did not honour the shortened wait")
+        assert_true(not dest.exists(), "published despite the held lock")
+    finally:
+        stateio.LOCK_WAIT_SECONDS = original
+        held.close()
+
+
+def test_settings_has_one_writer(tmp: Path) -> None:
+    """updateSettings must not spawn a detached save beside the queued job."""
+    qml = (HERE.parent / "Service.qml").read_text()
+    assert_true("persistSettings" not in qml, "detached settings writer still present")
+    assert_true('backend, "save"' not in qml, "save job still raced beside apply/disable")
+
+
 STUB_TOOLS = {
     "uname": "#!/bin/sh\nprintf 'x86_64\\n'\n",
     "pkg-config": "#!/bin/sh\nexit 0\n",
@@ -412,6 +470,9 @@ def main() -> int:
         test_backend_refuses_unsafe_state_path,
         test_backend_build_pipeline,
         test_backend_build_log_budget,
+        test_concurrent_publish_no_inode_mismatch,
+        test_publish_lock_times_out,
+        test_settings_has_one_writer,
     ]
     failed = 0
     for test in tests:
