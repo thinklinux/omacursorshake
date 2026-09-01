@@ -7,6 +7,11 @@ set -euo pipefail
 
 SRC=$(cd "$(dirname "$0")" && pwd)
 ID=$(jq -r '.id' "$SRC/manifest.json")
+# The id becomes a path below; never let it traverse out of the plugin dir.
+[[ $ID =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+  echo "manifest id is not a safe path component: $ID" >&2
+  exit 1
+}
 DEST="$HOME/.config/omarchy/plugins/$ID"
 
 omarchy plugin validate "$SRC"

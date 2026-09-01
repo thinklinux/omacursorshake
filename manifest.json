@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.thinklinux.omacursorshake",
   "name": "Shake to find",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "author": "Tihomir Valkanov",
   "license": "MIT",
   "description": "Shake the mouse to enlarge the cursor, like macOS. Zoom only — no tilt.",

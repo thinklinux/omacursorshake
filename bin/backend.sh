@@ -17,6 +17,21 @@ SETTINGS_PATH="$STATE_DIR/settings.json"
 APPLY_LUA="$STATE_DIR/apply.lua"
 BUILD_LOG="$STATE_DIR/build.log"
 REPO_URL="https://github.com/VirtCode/hypr-dynamic-cursors.git"
+# Config keys that make git execute a command on our behalf. The source tree
+# is re-cloned from scratch on every build so a planted .git cannot reach
+# these, but the same-uid actor who could plant one could equally edit
+# ~/.gitconfig, and clone applies init.templateDir from there. Global config
+# is otherwise left intact so proxy settings keep working.
+GIT_SAFE=(
+  -c core.hooksPath=/dev/null
+  -c init.templateDir=
+  -c core.fsmonitor=
+  -c core.pager=cat
+  -c core.editor=true
+  -c core.sshCommand=false
+  -c protocol.file.allow=never
+  -c protocol.ext.allow=never
+)
 DIAG_BYTES=2048
 LOG_BUDGET=65536
 IPC_TIMEOUT=5
@@ -77,6 +92,12 @@ sanitize_field() {
   printf '%s' "${v:0:${2:-128}}"
 }
 
+# Used before the tool preflight passes: cannot rely on tr/tail/python3.
+fail_plain() {
+  printf 'omacursorshake: %s\n' "$*" >&2
+  exit 1
+}
+
 # The message goes out first so a long log tail can never truncate it away.
 fail() {
   emit_diag "omacursorshake: $*"
@@ -97,7 +118,7 @@ fail() {
 require_base_tools() {
   local tool
   for tool in timeout head tr tail jq python3; do
-    command -v "$tool" >/dev/null || fail "$tool is required but was not found in PATH"
+    command -v "$tool" >/dev/null || fail_plain "$tool is required but was not found in PATH"
   done
 }
 
@@ -240,19 +261,24 @@ plugin_rev_for() {
   esac
 }
 
+# Piped straight into jq: no shell variable holds the response. Empty input
+# (no compositor, timeout, byte ceiling hit) makes jq -e exit non-zero, which
+# is the "not loaded" answer we want.
+#
+# When the compositor reports a path, match on that and ignore names entirely.
+# Hyprland 0.56 reports only name/author/handle/version, so in practice the
+# name branch runs; callers that need proof of *our* load must not treat this
+# as sufficient on its own (see cmd_load).
 plugin_loaded() {
-  # Piped straight into jq: no shell variable holds the response. Empty
-  # input (no compositor, timeout, byte ceiling hit) makes jq -e exit
-  # non-zero, which is the "not loaded" answer we want.
   hyprctl_capture "$IPC_MAX_BYTES" -j plugin list \
     | jq -e --arg so "$SO_PATH" '
-    (type == "array" and (
-      any(.[]; (
-        (.name // .plugin // .handle // "") | tostring | test("dynamic-cursors"; "i")
-      ) or (
-        (.path // .filename // "") | tostring | contains($so)
-      ))
-    )) or (type == "object" and ((.name // "") | test("dynamic-cursors"; "i")))
+    def entries: if type == "array" then .[] elif type == "object" then . else empty end;
+    def pathof: (.path // .filename // "") | tostring;
+    def nameof: (.name // .plugin // .handle // "") | tostring;
+    if [entries | select(pathof != "")] | length > 0
+    then any(entries; pathof | contains($so))
+    else any(entries; nameof | test("dynamic-cursors"; "i"))
+    end
   ' >/dev/null 2>&1
 }
 
@@ -292,10 +318,13 @@ write_apply_lua() {
     timeout=2000
   fi
 
+  # Shape and range: a hand-edited settings.json bypasses the QML clamps, and
+  # the regexes alone would accept an arbitrarily long digit string.
   [[ $enabled == true || $enabled == false ]] || fail "settings.enabled must be boolean"
-  [[ $threshold =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "settings.threshold must be a number"
-  [[ $base =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "settings.base must be a number"
-  [[ $timeout =~ ^[0-9]+$ ]] || fail "settings.timeout must be an integer"
+  [[ $threshold =~ ^[0-9]{1,3}([.][0-9]{1,3})?$ ]] || fail "settings.threshold must be a number"
+  [[ $base =~ ^[0-9]{1,3}([.][0-9]{1,3})?$ ]] || fail "settings.base must be a number"
+  [[ $timeout =~ ^[0-9]{1,6}$ ]] || fail "settings.timeout must be an integer"
+  (( timeout >= 100 && timeout <= 60000 )) || fail "settings.timeout must be 100-60000 ms"
 
   # Default simulation mode is tilt. hl.config() updates the Hyprlang store
   # but CVariantProp keeps the live MODE until activate() (setShape or a
@@ -364,7 +393,9 @@ force_cursor_activate() {
     theme=Adwaita
   fi
   theme=$(sanitize_field "$theme" 128)
-  [[ -n $theme ]] || theme=Adwaita
+  # Allowlist, not just a control-character strip: a leading '-' would reach
+  # hyprctl as an option rather than a cursor theme name.
+  [[ $theme =~ ^[A-Za-z0-9_.][A-Za-z0-9_.\ -]*$ ]] || theme=Adwaita
   size=${HYPRCURSOR_SIZE:-${XCURSOR_SIZE:-24}}
   [[ $size =~ ^[0-9]+$ ]] || size=24
   run_diag hyprctl setcursor "$theme" "$size" || true
@@ -432,6 +463,19 @@ ensure_tree() {
   pkg-config --exists hyprland || fail "pkg-config hyprland is missing; install the hyprland package"
 }
 
+# The tree we are about to compile must be exactly the pinned commit, with
+# nothing extra in it for make to pick up.
+verify_source_tree() {
+  local want=$1 head="" dirty=""
+  head=$(capture_bounded 128 "$CHECKOUT_TIMEOUT" \
+    git "${GIT_SAFE[@]}" -C "$SRC_DIR" rev-parse HEAD)
+  head=$(sanitize_field "$head" 64)
+  [[ $head == "$want" ]] || fail "checkout is '${head:-empty}', expected the pinned $want"
+  dirty=$(capture_bounded 4096 "$CHECKOUT_TIMEOUT" \
+    git "${GIT_SAFE[@]}" -C "$SRC_DIR" status --porcelain --untracked-files=all)
+  [[ -z $dirty ]] || fail "source tree is not clean after checkout; refusing to build"
+}
+
 cmd_ensure() {
   local force=${1:-0}
   ensure_tree
@@ -453,23 +497,20 @@ cmd_ensure() {
 
   emit_diag "omacursorshake: building hypr-dynamic-cursors $plugin_rev for Hyprland $hl_commit"
 
-  local need_clone=1
-  if python3 "$STATEIO" is-dir "$SRC_DIR"; then
-    python3 "$STATEIO" ensure-dir "$SRC_DIR"
-    if python3 "$STATEIO" is-dir "$SRC_DIR/.git"; then
-      need_clone=0
-    fi
-  fi
-  if (( need_clone == 1 )); then
-    python3 "$STATEIO" rm-tree "$STATE_DIR" src
-    run_timed "$CLONE_TIMEOUT" git clone --filter=blob:none --no-checkout "$REPO_URL" "$SRC_DIR"
-    python3 "$STATEIO" ensure-dir "$SRC_DIR"
-  fi
+  # Always rebuild the tree from scratch. Reusing whatever sits in $SRC_DIR
+  # let a same-uid process pre-plant git hooks, executable git config, or an
+  # untracked GNUmakefile -- which GNU make prefers over Makefile and which
+  # survives checkout -- and so reach `make` and then the compositor dlopen.
+  python3 "$STATEIO" rm-tree "$STATE_DIR" src
+  run_timed "$CLONE_TIMEOUT" git "${GIT_SAFE[@]}" clone \
+    --filter=blob:none --no-checkout "$REPO_URL" "$SRC_DIR"
+  python3 "$STATEIO" ensure-dir "$SRC_DIR"
 
-  run_timed "$FETCH_TIMEOUT" git -C "$SRC_DIR" remote set-url origin "$REPO_URL"
-  run_timed "$FETCH_TIMEOUT" git -C "$SRC_DIR" fetch --force origin "$plugin_rev"
-  run_timed "$CHECKOUT_TIMEOUT" git -C "$SRC_DIR" checkout --detach "$plugin_rev"
-  run_timed "$MAKE_TIMEOUT" make -C "$SRC_DIR" all
+  run_timed "$FETCH_TIMEOUT" git "${GIT_SAFE[@]}" -C "$SRC_DIR" fetch --force origin "$plugin_rev"
+  run_timed "$CHECKOUT_TIMEOUT" git "${GIT_SAFE[@]}" -C "$SRC_DIR" checkout --detach "$plugin_rev"
+  verify_source_tree "$plugin_rev"
+  # -f Makefile: never let a GNUmakefile take precedence.
+  run_timed "$MAKE_TIMEOUT" make -f Makefile -C "$SRC_DIR" all
   python3 "$STATEIO" exists "$SRC_DIR/out/dynamic-cursors.so" \
     || fail "build finished but $SRC_DIR/out/dynamic-cursors.so is missing or not a regular file"
 
@@ -485,10 +526,15 @@ cmd_load() {
   ingest_settings_json "${1:-}"
   python3 "$STATEIO" exists "$SO_PATH" || fail "plugin is not built yet"
   if ! plugin_loaded; then
-    run_diag hyprctl plugin load "$SO_PATH" || true
-    # Ask the compositor whether it took, rather than matching on the text
-    # of its reply. This also covers the "already loaded" answer.
-    plugin_loaded || fail "hyprctl plugin load failed"
+    local load_rc=0
+    run_diag hyprctl plugin load "$SO_PATH" || load_rc=$?
+    # Two independent signals. hyprctl's own exit status says the request
+    # succeeded; the plugin list says something matching is loaded. On
+    # Hyprland 0.56 the list carries no path, so the name match alone is weak
+    # evidence and must not stand in for the exit status.
+    plugin_loaded || fail "hyprctl plugin load failed (exit ${load_rc})"
+    (( load_rc == 0 )) \
+      || emit_diag "omacursorshake: hyprctl exited ${load_rc} but a matching plugin is listed"
   fi
   eval_apply || true
   cmd_status

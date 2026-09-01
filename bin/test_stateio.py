@@ -379,18 +379,27 @@ STUB_TOOLS = {
     ),
     "git": (
         "#!/bin/sh\n"
-        "echo \"git $*\"\n"
+        "echo \"git $*\" >&2\n"
+        "while [ \"$1\" = \"-c\" ]; do shift 2; done\n"
+        "dir=\"\"\n"
+        "if [ \"$1\" = \"-C\" ]; then dir=$2; shift 2; fi\n"
         "case \"$1\" in\n"
-        "  clone) mkdir -p \"$5/.git\" 2>/dev/null || mkdir -p \"$4/.git\" ;;\n"
+        "  clone) shift; for a in \"$@\"; do last=$a; done; mkdir -p \"$last/.git\" ;;\n"
+        "  rev-parse) printf '%s\\n' \"${STUB_HEAD:-5a224284872208b5324759d535d65061043725de}\" ;;\n"
+        "  status) printf '%s' \"${STUB_DIRTY:-}\" ;;\n"
         "esac\n"
         "exit 0\n"
     ),
     "make": (
         "#!/bin/sh\n"
-        "echo \"make $*\"\n"
+        "echo \"make $*\" >&2\n"
+        "[ -n \"${STUB_ARGV_LOG:-}\" ] && echo \"make $*\" >> \"$STUB_ARGV_LOG\"\n"
+        "while [ $# -gt 0 ]; do\n"
+        "  case \"$1\" in -C) dir=$2; shift 2 ;; *) shift ;; esac\n"
+        "done\n"
         "${NOISE_CMD:-true}\n"
-        "mkdir -p \"$2/out\"\n"
-        "printf 'ELF-STUB\\n' > \"$2/out/dynamic-cursors.so\"\n"
+        "mkdir -p \"$dir/out\"\n"
+        "printf 'ELF-STUB\\n' > \"$dir/out/dynamic-cursors.so\"\n"
         "exit 0\n"
     ),
 }
@@ -398,7 +407,7 @@ STUB_TOOLS = {
 
 def stub_path(tmp: Path) -> str:
     stubs = tmp / "stubs"
-    stubs.mkdir()
+    stubs.mkdir(parents=True, exist_ok=True)
     for name, body in STUB_TOOLS.items():
         f = stubs / name
         f.write_text(body)
@@ -528,6 +537,134 @@ def test_hyprctl_output_is_byte_bounded(tmp: Path) -> None:
         assert_true(not bare.search(stripped), f"unbounded hyprctl capture: {stripped}")
 
 
+def test_gnumakefile_precedence_is_defeated(tmp: Path) -> None:
+    """The real mechanism: GNU make prefers GNUmakefile unless -f is given."""
+    proj = tmp / "proj"
+    proj.mkdir()
+    (proj / "Makefile").write_text("all:\n\t@touch %s\n" % (proj / "ok"))
+    (proj / "GNUmakefile").write_text("all:\n\t@touch %s\n" % (proj / "bad"))
+
+    subprocess.run(["make", "-C", str(proj), "all"], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert_true((proj / "bad").exists(), "precondition: make should prefer GNUmakefile")
+
+    (proj / "bad").unlink()
+    subprocess.run(["make", "-f", "Makefile", "-C", str(proj), "all"], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert_true((proj / "ok").exists(), "-f Makefile did not run the intended file")
+    assert_true(not (proj / "bad").exists(), "-f Makefile still ran GNUmakefile")
+
+    assert_true("make -f Makefile -C" in BACKEND.read_text(), "backend does not pin -f Makefile")
+
+
+def test_planted_source_tree_is_destroyed(tmp: Path) -> None:
+    """A pre-planted src tree must never survive into checkout or make."""
+    state = tmp / "state"
+    sdir = state / "omarchy" / "omacursorshake"
+    src = sdir / "src"
+    (src / ".git" / "hooks").mkdir(parents=True)
+    marker = tmp / "HOOK-RAN"
+    hook = src / ".git" / "hooks" / "post-checkout"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    hook.chmod(0o755)
+    (src / ".git" / "config").write_text("[core]\n\tfsmonitor = touch %s\n" % (tmp / "FSMON-RAN"))
+    (src / "GNUmakefile").write_text("all:\n\t@touch %s\n" % (tmp / "GNUMAKE-RAN"))
+    planted = src / "planted-marker"
+    planted.write_text("x")
+
+    env = backend_env(tmp, state)
+    argv_log = tmp / "make-argv.log"
+    env["STUB_ARGV_LOG"] = str(argv_log)
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "ensure"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
+    for m in ("HOOK-RAN", "FSMON-RAN", "GNUMAKE-RAN"):
+        assert_true(not (tmp / m).exists(), f"{m}: planted code executed")
+    assert_true(not planted.exists(), "planted file survived into the build tree")
+    assert_true("-f Makefile" in argv_log.read_text(), "make was not pinned to Makefile")
+
+    src_txt = BACKEND.read_text()
+    assert_true("need_clone" not in src_txt, "source-tree reuse branch is back")
+    assert_true("core.hooksPath=/dev/null" in src_txt, "git hook neutralisation missing")
+
+
+def test_checkout_must_match_the_pin(tmp: Path) -> None:
+    """A tree that is not the pinned commit, or is dirty, must not be built."""
+    env = backend_env(tmp / "wrong", tmp / "wrong" / "state")
+    env["STUB_HEAD"] = "0" * 40
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "ensure"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode != 0, "built from the wrong commit")
+    assert_true(b"expected the pinned" in proc.stderr, f"err: {proc.stderr!r}")
+
+    env = backend_env(tmp / "dirty", tmp / "dirty" / "state")
+    env["STUB_DIRTY"] = "?? injected.cpp\n"
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "ensure"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode != 0, "built from a dirty tree")
+    assert_true(b"not clean" in proc.stderr, f"err: {proc.stderr!r}")
+
+
+def test_load_honours_hyprctl_exit_status(tmp: Path) -> None:
+    """A failed load must fail even though the name matcher is all we have."""
+    body = (
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *version*) printf '{\"commit\":\"efb50993780079460b0cbed1363e2166a2de1d9f\"}\\n' ;;\n"
+        "  *'plugin list'*) printf '[]\\n' ;;\n"
+        "  *'plugin load'*) echo 'could not load'; exit 1 ;;\n"
+        "  *) printf 'ok\\n' ;;\n"
+        "esac\n"
+    )
+    env = _hyprctl_stub(tmp / "load", body)
+    state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
+    state.mkdir(parents=True)
+    (state / "dynamic-cursors.so").write_bytes(b"ELF-STUB\n")
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "load", '{"enabled":true}'],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode != 0, "load succeeded despite hyprctl failing")
+    assert_true(b"plugin load failed" in proc.stderr, f"err: {proc.stderr!r}")
+
+
+def test_cursor_theme_option_injection_refused(tmp: Path) -> None:
+    argv_log = tmp / "hyprctl-argv.log"
+    body = (
+        "#!/bin/sh\n"
+        f"echo \"$*\" >> {argv_log}\n"
+        "case \"$*\" in\n"
+        "  *version*) printf '{\"commit\":\"efb50993780079460b0cbed1363e2166a2de1d9f\"}\\n' ;;\n"
+        "  *'plugin list'*) printf '[{\"name\":\"dynamic-cursors\"}]\\n' ;;\n"
+        "  *) printf 'ok\\n' ;;\n"
+        "esac\n"
+    )
+    env = _hyprctl_stub(tmp / "theme", body)
+    env["HYPRCURSOR_THEME"] = "--evil-option"
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "apply", '{"enabled":true}'],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode == 0, f"apply failed: {proc.stderr!r}")
+    logged = argv_log.read_text()
+    assert_true("setcursor Adwaita" in logged, f"theme not sanitised: {logged!r}")
+    assert_true("--evil-option" not in logged, f"option reached hyprctl: {logged!r}")
+
+
+def test_watchdog_and_installer_guards() -> None:
+    qml = (HERE.parent / "Service.qml").read_text()
+    assert_true("jobWatchdog" in qml and "job.running = false" in qml, "no Process watchdog")
+    assert_true("running: job.running" in qml, "watchdog is not armed by the job")
+    installer = (HERE.parent / "install.sh").read_text()
+    assert_true("A-Za-z0-9._-" in installer, "installer does not validate the manifest id")
+
+
 def main() -> int:
     tests = [
         test_source_never_reopens_full_path,
@@ -550,12 +687,18 @@ def main() -> int:
         test_settings_has_one_writer,
         test_hyprctl_calls_are_time_bounded,
         test_hyprctl_output_is_byte_bounded,
+        test_gnumakefile_precedence_is_defeated,
+        test_planted_source_tree_is_destroyed,
+        test_checkout_must_match_the_pin,
+        test_load_honours_hyprctl_exit_status,
+        test_cursor_theme_option_injection_refused,
+        test_watchdog_and_installer_guards,
     ]
     failed = 0
     for test in tests:
         tmp = Path(tempfile.mkdtemp(prefix="stateio-test-"))
         try:
-            if test is test_source_never_reopens_full_path:
+            if test in (test_source_never_reopens_full_path, test_watchdog_and_installer_guards):
                 test()
             else:
                 test(tmp)

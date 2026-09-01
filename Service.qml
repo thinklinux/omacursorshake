@@ -60,6 +60,11 @@ Item {
   property string generation: ""
   property double lastApplyAt: 0
   readonly property int diagnosticMaxChars: 480
+  // Longest legitimate job is a full build: clone + fetch + checkout + make,
+  // whose backend-side timeouts total 570s. Anything past this margin means a
+  // child escaped its timeout, and the queue must not stay wedged forever.
+  readonly property int jobWatchdogMs: 900000
+  property bool jobTimedOut: false
 
   function clampNumber(value, fallback, min, max) {
     var n = Number(value)
@@ -201,6 +206,18 @@ Item {
     Quickshell.execDetached(["bash", backend, "claim", root.generation])
   }
 
+  Timer {
+    id: jobWatchdog
+    interval: root.jobWatchdogMs
+    running: job.running
+    repeat: false
+    onTriggered: {
+      root.jobTimedOut = true
+      // Terminates the child; onExited then runs the normal failure path.
+      job.running = false
+    }
+  }
+
   Process {
     id: job
     stdout: StdioCollector { id: jobOut; waitForEnd: true }
@@ -209,14 +226,18 @@ Item {
       var out = String(jobOut.text || "")
       var err = String(jobErr.text || "").trim()
       var name = root.currentJob
+      var timedOut = root.jobTimedOut
       root.currentJob = ""
+      root.jobTimedOut = false
 
-      if (code !== 0) {
+      if (code !== 0 || timedOut) {
         root.building = false
-        root.lastError = root.sanitizeDiagnostic(err || (name + " failed"))
+        root.lastError = timedOut
+          ? (name + " exceeded " + Math.round(root.jobWatchdogMs / 1000) + "s and was stopped")
+          : root.sanitizeDiagnostic(err || (name + " failed"))
         root.phase = root.supported ? "error" : "unsupported"
         root.statusText = root.lastError
-        if (name === "ensure" || name === "load")
+        if (name === "ensure" || name === "load" || timedOut)
           root.notify("Shake to find failed", root.lastError)
         root.pump()
         return

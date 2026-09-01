@@ -170,6 +170,7 @@ Panel {
             Text {
               id: sensValue
               text: Number(root.currentSettings.threshold).toFixed(0)
+              textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -215,6 +216,7 @@ Panel {
             Text {
               id: magValue
               text: Number(root.currentSettings.base).toFixed(0) + "×"
+              textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -260,6 +262,7 @@ Panel {
             Text {
               id: holdValue
               text: (Number(root.currentSettings.timeout) / 1000).toFixed(1) + "s"
+              textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
