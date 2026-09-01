@@ -24,15 +24,67 @@ FETCH_TIMEOUT=120
 CHECKOUT_TIMEOUT=30
 MAKE_TIMEOUT=300
 
+# Strip control characters and keep only the last DIAG_BYTES. tail -c must
+# read its whole input, so this never SIGPIPEs an upstream producer.
+cap_diag() {
+  tr -d '\000-\010\013\014\016-\037\177' | tail -c "$DIAG_BYTES"
+}
+
+emit_diag() {
+  printf '%s\n' "$*" | cap_diag >&2
+}
+
+# Run a command and forward at most DIAG_BYTES of its combined output.
+# Quickshell collects this stream in memory for the life of the shell, so
+# nothing external is allowed onto stderr unbounded.
+run_diag() {
+  local rc=0 had_e=0
+  [[ $- == *e* ]] && had_e=1
+  set +e
+  "$@" 2>&1 | cap_diag >&2
+  rc=${PIPESTATUS[0]}
+  (( had_e )) && set -e
+  return "$rc"
+}
+
+# Bounded, control-stripped scalar for anything sourced outside this script.
+sanitize_field() {
+  local v=${1:-}
+  v=${v//[[:cntrl:]]/}
+  printf '%s' "${v:0:${2:-128}}"
+}
+
+# The message goes out first so a long log tail can never truncate it away.
 fail() {
-  {
-    printf 'omacursorshake: %s\n' "$*"
-    if [[ -n ${BUILD_LOG:-} ]]; then
-      printf 'omacursorshake: build log tail:\n'
-      python3 "$STATEIO" read "$BUILD_LOG" "$DIAG_BYTES" 2>/dev/null || true
+  emit_diag "omacursorshake: $*"
+  if [[ -n ${BUILD_LOG:-} && -n ${STATEIO:-} ]]; then
+    local log_tail=""
+    log_tail=$(python3 "$STATEIO" read-tail "$BUILD_LOG" "$DIAG_BYTES" 2>/dev/null || true)
+    if [[ -n $log_tail ]]; then
+      emit_diag "omacursorshake: build log tail:"
+      emit_diag "$log_tail"
     fi
-  } | tr -d '\000-\010\013\014\016-\037\177' | tail -c "$DIAG_BYTES" >&2
+  fi
   exit 1
+}
+
+# apply.lua is handed to Hyprland as dofile([==[<path>]==]) and every state
+# path is also passed to git/make. Refuse anything that could close the Lua
+# long bracket or smuggle control characters into the compositor.
+require_safe_state_path() {
+  local p=${1:-}
+  if [[ $p != /* ]]; then
+    fail "state path must be absolute (got: ${p:-empty})"
+  fi
+  if [[ $p == *"["* || $p == *"]"* ]]; then
+    fail "state path must not contain square brackets"
+  fi
+  if [[ $p =~ [[:cntrl:]] ]]; then
+    fail "state path must not contain control characters"
+  fi
+  if [[ $p == *"/../"* || $p == *"/.." ]]; then
+    fail "state path must not contain .."
+  fi
 }
 
 ensure_state_dir() {
@@ -59,12 +111,16 @@ run_timed() {
   shift
   ensure_state_dir
   local tcode=0 capcode=0
+  local -a codes=()
   set +e
   timeout --foreground --signal=TERM --kill-after=8 "$secs" "$@" 2>&1 \
     | cap_output_ring "$BUILD_LOG"
-  tcode=${PIPESTATUS[0]}
-  capcode=${PIPESTATUS[1]}
+  # Snapshot both stages at once: any command in between, an assignment
+  # included, replaces PIPESTATUS.
+  codes=("${PIPESTATUS[@]}")
   set -e
+  tcode=${codes[0]:-1}
+  capcode=${codes[1]:-1}
   if (( capcode == 2 )); then
     fail "output exceeded ${LOG_BUDGET}-byte budget: $*"
   fi
@@ -80,12 +136,22 @@ run_timed() {
   fail "failed ($tcode): $*"
 }
 
+hyprctl_version_json() {
+  local out=""
+  out=$(hyprctl -j version 2>/dev/null) || out=""
+  printf '%s' "${out:0:65536}"
+}
+
 hyprland_commit() {
-  hyprctl -j version 2>/dev/null | jq -r '.commit // empty'
+  local raw=""
+  raw=$(hyprctl_version_json | jq -r '.commit // empty' 2>/dev/null || true)
+  sanitize_field "$raw" 64
 }
 
 hyprland_version() {
-  hyprctl -j version 2>/dev/null | jq -r '.version // empty'
+  local raw=""
+  raw=$(hyprctl_version_json | jq -r '.version // empty' 2>/dev/null || true)
+  sanitize_field "$raw" 128
 }
 
 require_commit_sha() {
@@ -145,6 +211,7 @@ plugin_rev_for() {
 plugin_loaded() {
   local list
   list=$(hyprctl -j plugin list 2>/dev/null || echo "[]")
+  list=${list:0:262144}
   jq -e --arg so "$SO_PATH" '
     (type == "array" and (
       any(.[]; (
@@ -170,6 +237,7 @@ install_so() {
 ingest_settings_json() {
   local raw=${1:-}
   [[ -n $raw ]] || return 0
+  (( ${#raw} <= 65536 )) || fail "settings JSON exceeds 65536 bytes"
   ensure_state_dir
   jq -e 'type == "object"' <<<"$raw" >/dev/null || fail "settings JSON is invalid"
   printf '%s\n' "$raw" | secure_write "$SETTINGS_PATH"
@@ -262,14 +330,16 @@ force_cursor_activate() {
   if [[ -z $theme || $theme == default ]]; then
     theme=Adwaita
   fi
+  theme=$(sanitize_field "$theme" 128)
+  [[ -n $theme ]] || theme=Adwaita
   size=${HYPRCURSOR_SIZE:-${XCURSOR_SIZE:-24}}
   [[ $size =~ ^[0-9]+$ ]] || size=24
-  hyprctl setcursor "$theme" "$size" >&2 || true
+  run_diag hyprctl setcursor "$theme" "$size" || true
 }
 
 eval_apply() {
   write_apply_lua
-  hyprctl eval "dofile([[$APPLY_LUA]])" >&2
+  run_diag hyprctl eval "dofile([==[$APPLY_LUA]==])"
   force_cursor_activate
 }
 
@@ -280,7 +350,7 @@ cmd_status() {
   hl_commit=$(hyprland_commit)
   hl_ver=$(hyprland_version)
   built=$(secure_read "$STAMP_PATH" 128 || true)
-  built=${built//$'\n'/}
+  built=$(sanitize_field "${built//$'\n'/}" 64)
   so_exists=false
   python3 "$STATEIO" exists "$SO_PATH" && so_exists=true
   loaded=false
@@ -342,13 +412,13 @@ cmd_ensure() {
 
   local built_for=""
   built_for=$(secure_read "$STAMP_PATH" 128 || true)
-  built_for=${built_for//$'\n'/}
+  built_for=$(sanitize_field "${built_for//$'\n'/}" 64)
   if (( force == 0 )) && python3 "$STATEIO" exists "$SO_PATH" && [[ $built_for == "$hl_commit" ]]; then
     cmd_status
     return 0
   fi
 
-  echo "omacursorshake: building hypr-dynamic-cursors $plugin_rev for Hyprland $hl_commit" >&2
+  emit_diag "omacursorshake: building hypr-dynamic-cursors $plugin_rev for Hyprland $hl_commit"
 
   local need_clone=1
   if python3 "$STATEIO" is-dir "$SRC_DIR"; then
@@ -371,7 +441,7 @@ cmd_ensure() {
     || fail "build finished but $SRC_DIR/out/dynamic-cursors.so is missing or not a regular file"
 
   if [[ $was_loaded == true ]]; then
-    echo "omacursorshake: plugin is loaded; installing beside the mapped inode" >&2
+    emit_diag "omacursorshake: plugin is loaded; installing beside the mapped inode"
   fi
   install_so "$SRC_DIR/out/dynamic-cursors.so"
   printf '%s\n' "$hl_commit" | secure_write "$STAMP_PATH"
@@ -386,17 +456,22 @@ cmd_load() {
     cmd_status
     return 0
   fi
-  local out
-  if ! out=$(hyprctl plugin load "$SO_PATH" 2>&1); then
+  local out="" rc=0
+  set +e
+  out=$(hyprctl plugin load "$SO_PATH" 2>&1)
+  rc=$?
+  set -e
+  out=${out:0:8192}
+  if (( rc != 0 )); then
     if grep -qiE 'already loaded|plugin.*loaded' <<<"$out"; then
       eval_apply || true
       cmd_status
       return 0
     fi
-    echo "$out" >&2
+    emit_diag "$out"
     fail "hyprctl plugin load failed"
   fi
-  echo "$out" >&2
+  emit_diag "$out"
   eval_apply || true
   cmd_status
 }
@@ -430,7 +505,7 @@ cmd_save() {
 
 cmd_claim() {
   ensure_state_dir
-  printf '%s\n' "${1:-}" | secure_write "$STATE_DIR/owner"
+  printf '%s\n' "$(sanitize_field "${1:-}" 128)" | secure_write "$STATE_DIR/owner"
 }
 
 cmd_unload_if() {
@@ -441,6 +516,8 @@ usage() {
   echo "Usage: backend.sh <status|ensure|load|unload|unload-if|claim|apply|save>" >&2
   exit 2
 }
+
+require_safe_state_path "$STATE_DIR"
 
 cmd=${1:-}
 case "$cmd" in

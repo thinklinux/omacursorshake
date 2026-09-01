@@ -14,6 +14,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 STATEIO = HERE / "stateio.py"
+BACKEND = HERE / "backend.sh"
 
 sys.path.insert(0, str(HERE))
 import stateio  # noqa: E402
@@ -231,6 +232,169 @@ def test_rm_tree_still_dirfd(tmp: Path) -> None:
     assert_true((victim / "keep").is_file(), "rm-tree followed child symlink")
 
 
+def test_read_tail_returns_end_of_file(tmp: Path) -> None:
+    state = tmp / "state"
+    state.mkdir(mode=0o700)
+    log = state / "build.log"
+    log.write_bytes(b"H" * 4096 + b"LAST-LINE\n")
+    proc = run(["read-tail", str(log), "16"])
+    assert_true(proc.stdout == b"HHHHHHLAST-LINE\n", f"tail: {proc.stdout!r}")
+    # A short file comes back whole, and a missing one is empty, not an error.
+    short = state / "built-for"
+    short.write_bytes(b"abc\n")
+    assert_true(run(["read-tail", str(short), "64"]).stdout == b"abc\n", "short tail")
+    assert_true(run(["read-tail", str(state / "nope"), "64"]).stdout == b"", "missing tail")
+
+
+def test_writable_path_component_refused(tmp: Path) -> None:
+    for mode, kind in ((0o775, "group"), (0o777, "other")):
+        base = tmp / f"base-{kind}"
+        (base / "omarchy").mkdir(parents=True)
+        os.chmod(base, mode)
+        dest = base / "omarchy" / "omacursorshake" / "settings.json"
+        proc = run(["write", str(dest)], stdin=b"{}\n", check=False)
+        assert_true(proc.returncode != 0, f"{kind}-writable component accepted")
+        assert_true(b"writable path component" in proc.stderr, f"err: {proc.stderr!r}")
+        proc = run(["read", str(dest), "64"], check=False)
+        assert_true(proc.returncode != 0, f"{kind}-writable component read accepted")
+        # Sticky (like /tmp) is safe: entries can only be replaced by their owner.
+        os.chmod(base, mode | stat.S_ISVTX)
+        proc = run(["write", str(dest)], stdin=b"{}\n", check=False)
+        assert_true(proc.returncode == 0, f"sticky {kind}-writable refused: {proc.stderr!r}")
+
+
+def test_foreign_owned_component_refused(tmp: Path) -> None:
+    # /home is root-owned and must stay walkable; a non-root, non-self owner
+    # cannot be produced without privileges, so assert the rule directly.
+    fd = os.open("/home", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        stateio.validate_component_fd(fd, "/home")
+    finally:
+        os.close(fd)
+    src = STATEIO.read_text()
+    assert_true("st.st_uid not in (os.getuid(), 0)" in src, "component owner rule missing")
+
+
+def test_remove_depth_bounded(tmp: Path) -> None:
+    state = tmp / "state"
+    state.mkdir(mode=0o700)
+    deep = state / "src"
+    cur = deep
+    for _ in range(stateio.MAX_REMOVE_DEPTH + 4):
+        cur = cur / "d"
+    cur.mkdir(parents=True)
+    proc = run(["rm-tree", str(state), "src"], check=False)
+    assert_true(proc.returncode != 0, "unbounded recursion accepted")
+    assert_true(b"recurse past" in proc.stderr, f"err: {proc.stderr!r}")
+    assert_true(deep.exists(), "partial removal left no root")
+
+
+def test_backend_refuses_unsafe_state_path(tmp: Path) -> None:
+    env = dict(os.environ)
+    for bad in (str(tmp / "st]ate"), str(tmp / "st[ate")):
+        env["XDG_STATE_HOME"] = bad
+        proc = subprocess.run(
+            ["bash", str(BACKEND), "status"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        assert_true(proc.returncode != 0, f"accepted bracket path {bad}")
+        assert_true(b"square brackets" in proc.stderr, f"err: {proc.stderr!r}")
+    src = BACKEND.read_text()
+    # apply.lua must never be interpolated into a plain [[...]] long bracket.
+    assert_true("dofile([[" not in src, "unbracketed dofile still present")
+    assert_true("dofile([==[" in src, "safe dofile bracket missing")
+
+
+STUB_TOOLS = {
+    "uname": "#!/bin/sh\nprintf 'x86_64\\n'\n",
+    "pkg-config": "#!/bin/sh\nexit 0\n",
+    "g++": "#!/bin/sh\nexit 0\n",
+    "hyprctl": (
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *version*) printf '{\"commit\":\"%s\",\"version\":\"0.56.2\"}\\n' "
+        "efb50993780079460b0cbed1363e2166a2de1d9f ;;\n"
+        "  *'plugin list'*) printf '[]\\n' ;;\n"
+        "  *) printf 'ok\\n' ;;\n"
+        "esac\n"
+    ),
+    "git": (
+        "#!/bin/sh\n"
+        "echo \"git $*\"\n"
+        "case \"$1\" in\n"
+        "  clone) mkdir -p \"$5/.git\" 2>/dev/null || mkdir -p \"$4/.git\" ;;\n"
+        "esac\n"
+        "exit 0\n"
+    ),
+    "make": (
+        "#!/bin/sh\n"
+        "echo \"make $*\"\n"
+        "${NOISE_CMD:-true}\n"
+        "mkdir -p \"$2/out\"\n"
+        "printf 'ELF-STUB\\n' > \"$2/out/dynamic-cursors.so\"\n"
+        "exit 0\n"
+    ),
+}
+
+
+def stub_path(tmp: Path) -> str:
+    stubs = tmp / "stubs"
+    stubs.mkdir()
+    for name, body in STUB_TOOLS.items():
+        f = stubs / name
+        f.write_text(body)
+        f.chmod(0o755)
+    return f"{stubs}:{os.environ.get('PATH', '')}"
+
+
+def backend_env(tmp: Path, state: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    env["PATH"] = stub_path(tmp)
+    env["XDG_STATE_HOME"] = str(state)
+    return env
+
+
+def test_backend_build_pipeline(tmp: Path) -> None:
+    """run_timed must read both pipeline stages; a stale PIPESTATUS broke every build."""
+    state = tmp / "state"
+    env = backend_env(tmp, state)
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "ensure"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
+    assert_true(b"PIPESTATUS" not in proc.stderr, f"PIPESTATUS leak: {proc.stderr!r}")
+    sdir = state / "omarchy" / "omacursorshake"
+    so = sdir / "dynamic-cursors.so"
+    assert_true(so.is_file(), "no .so installed")
+    assert_true(so.stat().st_mode & 0o777 == 0o755, f"so mode {so.stat().st_mode:o}")
+    assert_true(
+        (sdir / "built-for").read_text().strip() == "efb50993780079460b0cbed1363e2166a2de1d9f",
+        "stamp not written",
+    )
+    status = proc.stdout.decode()
+    assert_true('"needsRebuild": false' in status, f"status: {status}")
+    log = sdir / "build.log"
+    assert_true(log.is_file() and log.stat().st_size <= 65536, "build log unbounded")
+
+
+def test_backend_build_log_budget(tmp: Path) -> None:
+    """A noisy phase must fail closed and keep build.log inside the budget."""
+    state = tmp / "state"
+    env = backend_env(tmp, state)
+    env["NOISE_CMD"] = "head -c 400000 /dev/zero | tr '\\0' 'n'"
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "ensure"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    assert_true(proc.returncode != 0, "noisy build accepted")
+    assert_true(b"budget" in proc.stderr, f"err: {proc.stderr!r}")
+    # The failure message survives; the log tail must never crowd it out.
+    assert_true(b"omacursorshake: output exceeded" in proc.stderr, f"err: {proc.stderr!r}")
+    log = state / "omarchy" / "omacursorshake" / "build.log"
+    assert_true(log.stat().st_size <= 65536, f"log grew to {log.stat().st_size}")
+
+
 def main() -> int:
     tests = [
         test_source_never_reopens_full_path,
@@ -241,6 +405,13 @@ def main() -> int:
         test_fifo_and_symlink_dest,
         test_copy_source_symlink,
         test_rm_tree_still_dirfd,
+        test_read_tail_returns_end_of_file,
+        test_writable_path_component_refused,
+        test_foreign_owned_component_refused,
+        test_remove_depth_bounded,
+        test_backend_refuses_unsafe_state_path,
+        test_backend_build_pipeline,
+        test_backend_build_log_budget,
     ]
     failed = 0
     for test in tests:

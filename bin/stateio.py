@@ -4,11 +4,14 @@
 Every path component is opened with O_NOFOLLOW|O_DIRECTORY from `/`.
 The final directory descriptor from that walk is kept and used for
 reads, writes, ring captures, copies, existence checks, and recursive
-removal. Full pathnames are never reopened after the walk. Files are
+removal. Full pathnames are never reopened after the walk. Every walked
+component must also be a non-symlink directory that is owned by the
+current user (or root) and is not group/other writable without the
+sticky bit, so no other account can swap a component under us. Files are
 opened with O_NOFOLLOW|O_NONBLOCK via dir_fd and fstat'd. Writes use an
 O_EXCL temporary in the already-opened directory, held open through
-write, fsync, and rename. Removal unlinks with dir_fd and refuses mount
-or identity changes.
+write, fsync, and rename. Removal unlinks with dir_fd, is depth-bounded,
+and refuses mount or identity changes.
 """
 
 from __future__ import annotations
@@ -23,6 +26,8 @@ CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 NOFOLLOW = os.O_NOFOLLOW
 NONBLOCK = os.O_NONBLOCK
 MAX_COPY = 32 * 1024 * 1024
+MAX_REMOVE_DEPTH = 64
+GROUP_OTHER_WRITE = stat.S_IWGRP | stat.S_IWOTH
 
 
 def fail(msg: str, code: int = 1) -> None:
@@ -81,11 +86,27 @@ def openat_dir(dirfd: int, name: str, label: str, *, missing_ok: bool = False) -
             except FileNotFoundError:
                 pass
         map_open_error(exc, label)
+    try:
+        validate_component_fd(fd, label)
+    except SystemExit:
+        os.close(fd)
+        raise
+    return fd
+
+
+def validate_component_fd(fd: int, label: str) -> os.stat_result:
+    """A walked component must not be swappable by another account."""
     st = os.fstat(fd)
     if not stat.S_ISDIR(st.st_mode):
-        os.close(fd)
         fail(f"not a directory: {label}")
-    return fd
+    if st.st_uid not in (os.getuid(), 0):
+        fail(f"path component not owned by the current user or root: {label}")
+    if (st.st_mode & GROUP_OTHER_WRITE) and not (st.st_mode & stat.S_ISVTX):
+        fail(
+            "refusing group/other-writable path component "
+            f"(mode {st.st_mode & 0o7777:04o}; chmod go-w it): {label}"
+        )
+    return st
 
 
 def mkdirat_nofollow(dirfd: int, name: str, label: str) -> None:
@@ -200,6 +221,29 @@ def read_file(path: str, max_bytes: int) -> bytes:
         except FileNotFoundError:
             return b""
         try:
+            return read_fd(fd, max_bytes)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dirfd)
+
+
+def read_tail(path: str, max_bytes: int) -> bytes:
+    """Last max_bytes of a state file, through the held walk descriptor."""
+    parent, name = split_leaf(path)
+    try:
+        dirfd = walk_dir(parent, create=False)
+    except FileNotFoundError:
+        return b""
+    try:
+        try:
+            fd = open_reg_at(dirfd, name, path)
+        except FileNotFoundError:
+            return b""
+        try:
+            size = os.fstat(fd).st_size
+            if size > max_bytes:
+                os.lseek(fd, size - max_bytes, os.SEEK_SET)
             return read_fd(fd, max_bytes)
         finally:
             os.close(fd)
@@ -402,12 +446,17 @@ def remove_dir_contents(
     root_expected: tuple[int, int, int],
     root_dev: int,
     label: str,
+    depth: int,
 ) -> None:
+    if depth > MAX_REMOVE_DEPTH:
+        fail(f"refusing to recurse past {MAX_REMOVE_DEPTH} levels: {label}")
     assert_dir_ident(rootfd, root_expected, "state directory")
     assert_dir_ident(dirfd, dir_expected, label)
     for name in os.listdir(dirfd):
         valid_dirent_name(name)
-        remove_entry(dirfd, name, dir_expected, rootfd, root_expected, root_dev, f"{label}/{name}")
+        remove_entry(
+            dirfd, name, dir_expected, rootfd, root_expected, root_dev, f"{label}/{name}", depth
+        )
         assert_dir_ident(rootfd, root_expected, "state directory")
         assert_dir_ident(dirfd, dir_expected, label)
 
@@ -420,7 +469,10 @@ def remove_entry(
     root_expected: tuple[int, int, int],
     root_dev: int,
     label: str,
+    depth: int = 0,
 ) -> None:
+    if depth > MAX_REMOVE_DEPTH:
+        fail(f"refusing to recurse past {MAX_REMOVE_DEPTH} levels: {label}")
     valid_dirent_name(name)
     assert_dir_ident(rootfd, root_expected, "state directory")
     assert_dir_ident(parentfd, parent_expected, os.path.dirname(label) or ".")
@@ -458,7 +510,9 @@ def remove_entry(
             if cst.st_ino != lst.st_ino or cst.st_dev != lst.st_dev:
                 fail(f"entry identity changed during removal: {label}")
             child_expected = dir_ident(cst)
-            remove_dir_contents(childfd, child_expected, rootfd, root_expected, root_dev, label)
+            remove_dir_contents(
+                childfd, child_expected, rootfd, root_expected, root_dev, label, depth + 1
+            )
             assert_dir_ident(childfd, child_expected, label)
         finally:
             os.close(childfd)
@@ -523,7 +577,8 @@ def remove_tree(path: str) -> None:
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         fail(
-            "stateio: usage: ensure-dir|read|write|write-ring|copy|exists|is-dir|rm-tree ..."
+            "stateio: usage: ensure-dir|read|read-tail|write|write-ring|copy|exists"
+            "|is-dir|rm-tree ..."
         )
     cmd = argv[1]
     if cmd == "ensure-dir":
@@ -536,6 +591,12 @@ def main(argv: list[str]) -> int:
             fail("stateio read <path> [max-bytes]")
         max_bytes = int(argv[3]) if len(argv) == 4 else 65536
         sys.stdout.buffer.write(read_file(argv[2], max_bytes))
+        return 0
+    if cmd == "read-tail":
+        if len(argv) not in (3, 4):
+            fail("stateio read-tail <path> [max-bytes]")
+        max_bytes = int(argv[3]) if len(argv) == 4 else 65536
+        sys.stdout.buffer.write(read_tail(argv[2], max_bytes))
         return 0
     if cmd == "write":
         if len(argv) not in (3, 4):

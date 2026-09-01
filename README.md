@@ -58,6 +58,11 @@ can be deleted too if you want it gone.
   version. Unsupported Hyprland versions fail instead of building `main`.
 - A Hyprland update rebuilds the compositor plugin on next login (stamp
   mismatch). Do not overwrite the mapped `.so` while Hyprland has it loaded.
+- Every component of the state path must be a real directory owned by you (or
+  root) and must not be group/other writable without the sticky bit. If
+  `~/.local` or `~/.local/state` is group writable, `chmod go-w` it; otherwise
+  the plugin refuses to read or publish state rather than risk a swapped
+  component. The path itself must not contain `[` or `]`.
 
 ## License
 
