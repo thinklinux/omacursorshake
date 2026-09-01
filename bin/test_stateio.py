@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -453,6 +454,80 @@ def test_backend_build_log_budget(tmp: Path) -> None:
     assert_true(log.stat().st_size <= 65536, f"log grew to {log.stat().st_size}")
 
 
+def _hyprctl_stub(tmp: Path, body: str) -> dict[str, str]:
+    tmp.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["PATH"] = stub_path(tmp)
+    stub = tmp / "stubs" / "hyprctl"
+    stub.write_text(body)
+    stub.chmod(0o755)
+    env["XDG_STATE_HOME"] = str(tmp / "state")
+    return env
+
+
+def test_hyprctl_calls_are_time_bounded(tmp: Path) -> None:
+    """A wedged compositor must not hang the backend, even via a grandchild.
+
+    timeout without --foreground runs the child in its own process group and
+    signals the group, so a forked grandchild cannot hold the capture pipe
+    open past the deadline.
+    """
+    cases = {
+        "direct": "#!/bin/sh\nsleep 600\n",
+        "grandchild": "#!/bin/sh\nsleep 600 &\nwait\n",
+        "slow-drip": "#!/bin/sh\nwhile :; do printf x; sleep 0.3; done\n",
+    }
+    for name, body in cases.items():
+        env = _hyprctl_stub(tmp / name, body)
+        start = time.monotonic()
+        proc = subprocess.run(
+            ["bash", str(BACKEND), "status"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+        )
+        elapsed = time.monotonic() - start
+        assert_true(proc.returncode == 0, f"{name}: rc={proc.returncode} {proc.stderr!r}")
+        assert_true(elapsed < 60, f"{name}: took {elapsed:.0f}s, not bounded")
+        assert_true(b'"loaded": false' in proc.stdout, f"{name}: {proc.stdout!r}")
+
+    src = BACKEND.read_text()
+    code = [ln for ln in src.splitlines() if not ln.strip().startswith("#")]
+    assert_true(
+        not any("--foreground" in ln for ln in code),
+        "--foreground signals only the direct child, so a grandchild defeats the timeout",
+    )
+    assert_true("timeout --signal=TERM" in src, "phase timeout missing")
+
+
+def test_hyprctl_output_is_byte_bounded(tmp: Path) -> None:
+    """An endless response must be cut at the stream, not buffered whole."""
+    body = (
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *version*) printf '{\"commit\":\"%s\",\"version\":\"0.56.2\"}\\n' "
+        "efb50993780079460b0cbed1363e2166a2de1d9f ;;\n"
+        "  *) yes '{\"name\":\"flood-dynamic-cursors\"}' ;;\n"
+        "esac\n"
+    )
+    env = _hyprctl_stub(tmp / "flood", body)
+    start = time.monotonic()
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "status"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode == 0, f"rc={proc.returncode}: {proc.stderr!r}")
+    assert_true(time.monotonic() - start < 30, "flood was not cut off promptly")
+    assert_true(len(proc.stdout) < 65536, f"status grew to {len(proc.stdout)} bytes")
+
+    src = BACKEND.read_text()
+    # No raw hyprctl capture may land in a shell variable un-truncated.
+    bare = re.compile(r"\$\(\s*hyprctl(?![_a-zA-Z0-9])")
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        assert_true(not bare.search(stripped), f"unbounded hyprctl capture: {stripped}")
+
+
 def main() -> int:
     tests = [
         test_source_never_reopens_full_path,
@@ -473,6 +548,8 @@ def main() -> int:
         test_concurrent_publish_no_inode_mismatch,
         test_publish_lock_times_out,
         test_settings_has_one_writer,
+        test_hyprctl_calls_are_time_bounded,
+        test_hyprctl_output_is_byte_bounded,
     ]
     failed = 0
     for test in tests:

@@ -19,6 +19,8 @@ BUILD_LOG="$STATE_DIR/build.log"
 REPO_URL="https://github.com/VirtCode/hypr-dynamic-cursors.git"
 DIAG_BYTES=2048
 LOG_BUDGET=65536
+IPC_TIMEOUT=5
+IPC_MAX_BYTES=65536
 CLONE_TIMEOUT=120
 FETCH_TIMEOUT=120
 CHECKOUT_TIMEOUT=30
@@ -34,16 +36,37 @@ emit_diag() {
   printf '%s\n' "$*" | cap_diag >&2
 }
 
-# Run a command and forward at most DIAG_BYTES of its combined output.
-# Quickshell collects this stream in memory for the life of the shell, so
-# nothing external is allowed onto stderr unbounded.
+# Capture at most $1 bytes of stdout under a hard $2-second runtime cap.
+# head stops reading at the ceiling and the producer is signalled, so the
+# complete response is never buffered in a shell variable first.
+capture_bounded() {
+  local max=$1 secs=$2
+  shift 2
+  { timeout --signal=TERM --kill-after=3 "$secs" "$@" </dev/null 2>/dev/null || true; } \
+    | head -c "$max"
+}
+
+# hyprctl talks to the compositor over a socket: bound both how long it can
+# hold us and how much of its answer we will read.
+hyprctl_capture() {
+  local max=$1
+  shift
+  capture_bounded "$max" "$IPC_TIMEOUT" hyprctl "$@"
+}
+
+# Run a command under the same runtime cap and forward at most DIAG_BYTES of
+# its combined output. cap_diag streams, so the producer's bytes are never
+# accumulated whole; Quickshell collects this stream for the life of the
+# shell, so nothing external is allowed onto stderr unbounded or untimed.
 run_diag() {
   local rc=0 had_e=0
+  local -a codes=()
   [[ $- == *e* ]] && had_e=1
   set +e
-  "$@" 2>&1 | cap_diag >&2
-  rc=${PIPESTATUS[0]}
+  timeout --signal=TERM --kill-after=3 "$IPC_TIMEOUT" "$@" </dev/null 2>&1 | cap_diag >&2
+  codes=("${PIPESTATUS[@]}")
   (( had_e )) && set -e
+  rc=${codes[0]:-1}
   return "$rc"
 }
 
@@ -71,6 +94,13 @@ fail() {
 # apply.lua is handed to Hyprland as dofile([==[<path>]==]) and every state
 # path is also passed to git/make. Refuse anything that could close the Lua
 # long bracket or smuggle control characters into the compositor.
+require_base_tools() {
+  local tool
+  for tool in timeout head tr tail jq python3; do
+    command -v "$tool" >/dev/null || fail "$tool is required but was not found in PATH"
+  done
+}
+
 require_safe_state_path() {
   local p=${1:-}
   if [[ $p != /* ]]; then
@@ -106,6 +136,12 @@ cap_output_ring() {
 
 # Timeout plus a hard on-disk byte ceiling. The log file never grows past
 # LOG_BUDGET while git/make run; extra output fails the phase.
+#
+# No --foreground on purpose: timeout then runs the command in its own
+# process group and signals the whole group on expiry. With --foreground
+# only the direct child is signalled, and a surviving grandchild (a compiler
+# under make, a helper under git) keeps the capture pipe open, so the reader
+# blocks forever and the timeout buys nothing.
 run_timed() {
   local secs=$1
   shift
@@ -113,7 +149,7 @@ run_timed() {
   local tcode=0 capcode=0
   local -a codes=()
   set +e
-  timeout --foreground --signal=TERM --kill-after=8 "$secs" "$@" 2>&1 \
+  timeout --signal=TERM --kill-after=8 "$secs" "$@" </dev/null 2>&1 \
     | cap_output_ring "$BUILD_LOG"
   # Snapshot both stages at once: any command in between, an assignment
   # included, replaces PIPESTATUS.
@@ -136,22 +172,18 @@ run_timed() {
   fail "failed ($tcode): $*"
 }
 
-hyprctl_version_json() {
-  local out=""
-  out=$(hyprctl -j version 2>/dev/null) || out=""
-  printf '%s' "${out:0:65536}"
+hyprland_field() {
+  local raw=""
+  raw=$(hyprctl_capture "$IPC_MAX_BYTES" -j version | jq -r "$1 // empty" 2>/dev/null || true)
+  sanitize_field "$raw" "$2"
 }
 
 hyprland_commit() {
-  local raw=""
-  raw=$(hyprctl_version_json | jq -r '.commit // empty' 2>/dev/null || true)
-  sanitize_field "$raw" 64
+  hyprland_field .commit 64
 }
 
 hyprland_version() {
-  local raw=""
-  raw=$(hyprctl_version_json | jq -r '.version // empty' 2>/dev/null || true)
-  sanitize_field "$raw" 128
+  hyprland_field .version 128
 }
 
 require_commit_sha() {
@@ -209,10 +241,11 @@ plugin_rev_for() {
 }
 
 plugin_loaded() {
-  local list
-  list=$(hyprctl -j plugin list 2>/dev/null || echo "[]")
-  list=${list:0:262144}
-  jq -e --arg so "$SO_PATH" '
+  # Piped straight into jq: no shell variable holds the response. Empty
+  # input (no compositor, timeout, byte ceiling hit) makes jq -e exit
+  # non-zero, which is the "not loaded" answer we want.
+  hyprctl_capture "$IPC_MAX_BYTES" -j plugin list \
+    | jq -e --arg so "$SO_PATH" '
     (type == "array" and (
       any(.[]; (
         (.name // .plugin // .handle // "") | tostring | test("dynamic-cursors"; "i")
@@ -220,7 +253,7 @@ plugin_loaded() {
         (.path // .filename // "") | tostring | contains($so)
       ))
     )) or (type == "object" and ((.name // "") | test("dynamic-cursors"; "i")))
-  ' <<<"$list" >/dev/null 2>&1
+  ' >/dev/null 2>&1
 }
 
 # Replace the directory entry, never truncate a mapped inode.
@@ -325,7 +358,7 @@ force_cursor_activate() {
   local theme size
   theme=${HYPRCURSOR_THEME:-${XCURSOR_THEME:-}}
   if [[ -z $theme || $theme == default ]]; then
-    theme=$(gsettings get org.gnome.desktop.interface cursor-theme 2>/dev/null | tr -d "'" || true)
+    theme=$(capture_bounded 256 5 gsettings get org.gnome.desktop.interface cursor-theme | tr -d "'")
   fi
   if [[ -z $theme || $theme == default ]]; then
     theme=Adwaita
@@ -346,7 +379,7 @@ eval_apply() {
 cmd_status() {
   ensure_state_dir
   local arch hl_commit hl_ver built loaded so_exists needs
-  arch=$(uname -m)
+  arch=$(capture_bounded 64 5 uname -m)
   hl_commit=$(hyprland_commit)
   hl_ver=$(hyprland_version)
   built=$(secure_read "$STAMP_PATH" 128 || true)
@@ -390,7 +423,7 @@ cmd_status() {
 
 ensure_tree() {
   ensure_state_dir
-  [[ $(uname -m) == x86_64 ]] || fail "hypr-dynamic-cursors only works on x86_64 (Hyprland function hooks)"
+  [[ $(capture_bounded 64 5 uname -m) == x86_64 ]] || fail "hypr-dynamic-cursors only works on x86_64 (Hyprland function hooks)"
   command -v git >/dev/null || fail "git is required to fetch hypr-dynamic-cursors"
   command -v make >/dev/null || fail "make is required to build hypr-dynamic-cursors"
   command -v g++ >/dev/null || fail "g++ is required to build hypr-dynamic-cursors"
@@ -451,27 +484,12 @@ cmd_ensure() {
 cmd_load() {
   ingest_settings_json "${1:-}"
   python3 "$STATEIO" exists "$SO_PATH" || fail "plugin is not built yet"
-  if plugin_loaded; then
-    eval_apply || true
-    cmd_status
-    return 0
+  if ! plugin_loaded; then
+    run_diag hyprctl plugin load "$SO_PATH" || true
+    # Ask the compositor whether it took, rather than matching on the text
+    # of its reply. This also covers the "already loaded" answer.
+    plugin_loaded || fail "hyprctl plugin load failed"
   fi
-  local out="" rc=0
-  set +e
-  out=$(hyprctl plugin load "$SO_PATH" 2>&1)
-  rc=$?
-  set -e
-  out=${out:0:8192}
-  if (( rc != 0 )); then
-    if grep -qiE 'already loaded|plugin.*loaded' <<<"$out"; then
-      eval_apply || true
-      cmd_status
-      return 0
-    fi
-    emit_diag "$out"
-    fail "hyprctl plugin load failed"
-  fi
-  emit_diag "$out"
   eval_apply || true
   cmd_status
 }
@@ -517,6 +535,7 @@ usage() {
   exit 2
 }
 
+require_base_tools
 require_safe_state_path "$STATE_DIR"
 
 cmd=${1:-}
