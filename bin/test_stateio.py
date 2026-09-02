@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -385,6 +386,7 @@ STUB_TOOLS = {
         "if [ \"$1\" = \"-C\" ]; then dir=$2; shift 2; fi\n"
         "case \"$1\" in\n"
         "  clone) shift; for a in \"$@\"; do last=$a; done; mkdir -p \"$last/.git\" ;;\n"
+        "  checkout) [ -n \"${STUB_SRC:-}\" ] && printf '%s' \"$STUB_SRC\" > \"$dir/source.cpp\" ;;\n"
         "  rev-parse) printf '%s\\n' \"${STUB_HEAD:-5a224284872208b5324759d535d65061043725de}\" ;;\n"
         "  status) printf '%s' \"${STUB_DIRTY:-}\" ;;\n"
         "esac\n"
@@ -415,6 +417,41 @@ def stub_path(tmp: Path) -> str:
     return f"{stubs}:{os.environ.get('PATH', '')}"
 
 
+PIN_0562 = "5a224284872208b5324759d535d65061043725de"
+
+
+def tree_digest(path: Path) -> str:
+    return run(["tree-digest", str(path)]).stdout.decode().strip()
+
+
+def patched_backend(tmp: Path, expected_digest: str) -> Path:
+    """A copy of backend.sh whose 0.56.2 source digest is the stub tree's.
+
+    The stub build pipeline cannot produce upstream's real source, so the
+    recorded digest is swapped for the stub tree's. Only that one hex string
+    changes: the gate itself is the shipped code, running for real.
+    """
+    bindir = tmp / "patched-bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(STATEIO, bindir / "stateio.py")
+    text = BACKEND.read_text()
+    head = text.index("plugin_digest_for()")
+    marker = f'  {PIN_0562}) echo "'
+    i = text.index(marker, head) + len(marker)
+    j = text.index('"', i)
+    dest = bindir / "backend.sh"
+    dest.write_text(text[:i] + expected_digest + text[j:])
+    dest.chmod(0o755)
+    return dest
+
+
+def empty_tree_digest(tmp: Path) -> str:
+    """Digest of a tree holding nothing but .git -- what the git stub leaves."""
+    d = tmp / "empty-tree"
+    (d / ".git").mkdir(parents=True, exist_ok=True)
+    return tree_digest(d)
+
+
 def backend_env(tmp: Path, state: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["PATH"] = stub_path(tmp)
@@ -426,8 +463,9 @@ def test_backend_build_pipeline(tmp: Path) -> None:
     """run_timed must read both pipeline stages; a stale PIPESTATUS broke every build."""
     state = tmp / "state"
     env = backend_env(tmp, state)
+    backend = patched_backend(tmp, empty_tree_digest(tmp))
     proc = subprocess.run(
-        ["bash", str(BACKEND), "ensure"],
+        ["bash", str(backend), "ensure"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
@@ -451,8 +489,9 @@ def test_backend_build_log_budget(tmp: Path) -> None:
     state = tmp / "state"
     env = backend_env(tmp, state)
     env["NOISE_CMD"] = "head -c 400000 /dev/zero | tr '\\0' 'n'"
+    backend = patched_backend(tmp, empty_tree_digest(tmp))
     proc = subprocess.run(
-        ["bash", str(BACKEND), "ensure"],
+        ["bash", str(backend), "ensure"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     assert_true(proc.returncode != 0, "noisy build accepted")
@@ -575,8 +614,9 @@ def test_planted_source_tree_is_destroyed(tmp: Path) -> None:
     env = backend_env(tmp, state)
     argv_log = tmp / "make-argv.log"
     env["STUB_ARGV_LOG"] = str(argv_log)
+    backend = patched_backend(tmp, empty_tree_digest(tmp))
     proc = subprocess.run(
-        ["bash", str(BACKEND), "ensure"],
+        ["bash", str(backend), "ensure"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
     )
     assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
@@ -732,6 +772,139 @@ def test_cursor_theme_option_injection_refused(tmp: Path) -> None:
     assert_true("--evil-option" not in logged, f"option reached hyprctl: {logged!r}")
 
 
+def test_tree_digest_is_canonical(tmp: Path) -> None:
+    """Same bytes -> same digest; any byte, mode, or name change -> different."""
+    def build(root: Path, order: list[str], body: bytes = b"int main(){}\n") -> Path:
+        root.mkdir(parents=True)
+        (root / ".git").mkdir()
+        (root / ".git" / "config").write_bytes(b"[core]\n")
+        (root / "src").mkdir()
+        for name in order:
+            (root / "src" / name).write_bytes(body)
+        (root / "Makefile").write_bytes(b"all:\n")
+        return root
+
+    a = build(tmp / "a", ["a.cpp", "b.cpp", "c.cpp"])
+    b = build(tmp / "deeper" / "path" / "b", ["c.cpp", "a.cpp", "b.cpp"])
+    da, db = tree_digest(a), tree_digest(b)
+    assert_true(da == db, "digest depends on creation order or on the tree's own path")
+    assert_true(len(da) == 64, f"not a sha256: {da}")
+
+    # .git differs between clones and is not compiled; it must not be hashed.
+    (a / ".git" / "config").write_bytes(b"[core]\n\tfsmonitor = evil\n")
+    assert_true(tree_digest(a) == da, ".git is being hashed")
+
+    (a / "src" / "a.cpp").write_bytes(b"int main(){ }\n")
+    assert_true(tree_digest(a) != da, "content change did not move the digest")
+
+    c = build(tmp / "c", ["a.cpp", "b.cpp", "c.cpp"])
+    (c / "Makefile").chmod(0o755)
+    assert_true(tree_digest(c) != da, "executable bit did not move the digest")
+
+    d = build(tmp / "d", ["a.cpp", "b.cpp", "c.cpp"])
+    (d / "src" / "c.cpp").rename(d / "src" / "d.cpp")
+    assert_true(tree_digest(d) != da, "renaming a file did not move the digest")
+
+    e = build(tmp / "e", ["a.cpp", "b.cpp"])
+    (e / "src" / "c.cpp").parent.mkdir(exist_ok=True)
+    (e / "src" / "c.cpp").write_bytes(b"")
+    f = build(tmp / "f", ["a.cpp", "b.cpp"])
+    (f / "src" / "c.cpp").write_bytes(b"")
+    (f / "src" / "c.cpp").write_bytes(b"")
+    assert_true(tree_digest(e) == tree_digest(f), "empty files hash inconsistently")
+
+
+def test_tree_digest_refuses_links_and_specials(tmp: Path) -> None:
+    """A link or special file in the tree is refused, never followed or skipped."""
+    root = tmp / "src"
+    (root / "sub").mkdir(parents=True)
+    (root / "Makefile").write_bytes(b"all:\n")
+    secret = tmp / "outside.txt"
+    secret.write_bytes(b"not part of the tree\n")
+
+    (root / "sub" / "link.cpp").symlink_to(secret)
+    proc = run(["tree-digest", str(root)], check=False)
+    assert_true(proc.returncode != 0, "symlinked file was digested")
+    assert_true(b"symlink in source tree" in proc.stderr, f"err: {proc.stderr!r}")
+    (root / "sub" / "link.cpp").unlink()
+
+    (root / "sub" / "dirlink").symlink_to(tmp)
+    proc = run(["tree-digest", str(root)], check=False)
+    assert_true(proc.returncode != 0, "symlinked directory was digested")
+    assert_true(b"symlink in source tree" in proc.stderr, f"err: {proc.stderr!r}")
+    (root / "sub" / "dirlink").unlink()
+
+    os.mkfifo(root / "sub" / "pipe")
+    proc = run(["tree-digest", str(root)], check=False)
+    assert_true(proc.returncode != 0, "fifo was digested")
+    assert_true(b"not a regular file" in proc.stderr, f"err: {proc.stderr!r}")
+
+
+def test_source_digest_gate_runs_before_make(tmp: Path) -> None:
+    """A tree that is not the reviewed source must not reach the compiler."""
+    good = b"// the reviewed source\n"
+    reference = tmp / "reference"
+    reference.mkdir()
+    (reference / ".git").mkdir()
+    (reference / "source.cpp").write_bytes(good)
+    expected = tree_digest(reference)
+    backend = patched_backend(tmp, expected)
+
+    env = backend_env(tmp, tmp / "ok" / "state")
+    env["STUB_SRC"] = good.decode()
+    env["STUB_ARGV_LOG"] = str(tmp / "make-ok.log")
+    proc = subprocess.run(
+        ["bash", str(backend), "ensure"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode == 0, f"matching tree refused: {proc.stderr!r}")
+    assert_true((tmp / "make-ok.log").exists(), "make never ran on the matching tree")
+
+    # One byte different: the commit SHA and the clean-tree check still pass,
+    # because the stub git reports what it is told to. Only the digest reads
+    # the bytes.
+    env = backend_env(tmp, tmp / "bad" / "state")
+    env["STUB_SRC"] = "// the reviewed sourc3\n"
+    argv_log = tmp / "make-bad.log"
+    env["STUB_ARGV_LOG"] = str(argv_log)
+    proc = subprocess.run(
+        ["bash", str(backend), "ensure"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode != 0, "tampered tree was built")
+    assert_true(b"digest is" in proc.stderr, f"err: {proc.stderr!r}")
+    assert_true(not argv_log.exists(), "make ran before the digest gate refused the tree")
+    assert_true(
+        not (tmp / "bad" / "state" / "omarchy" / "omacursorshake" / "dynamic-cursors.so").exists(),
+        "a .so was installed from a tampered tree",
+    )
+
+
+def test_every_pin_has_a_source_digest() -> None:
+    """No Hyprland version may map to a plugin commit we have not attested."""
+    text = BACKEND.read_text()
+
+    def case_body(name: str) -> str:
+        start = text.index(f"{name}() {{")
+        return text[start : text.index("\n}\n", start)]
+
+    entry = re.compile(r'^\s*([0-9a-f]{40})\) echo "([0-9a-f]{40,64})" ;;', re.M)
+    revs = {v for _, v in entry.findall(case_body("plugin_rev_for"))}
+    digests = {k: v for k, v in entry.findall(case_body("plugin_digest_for"))}
+    assert_true(bool(revs), "no pinned plugin commits found")
+    missing = sorted(revs - set(digests))
+    assert_true(not missing, f"pins without a source digest: {missing}")
+    stale = sorted(set(digests) - revs)
+    assert_true(not stale, f"digests for commits nothing maps to: {stale}")
+    for rev, d in digests.items():
+        assert_true(len(d) == 64, f"{rev}: digest is not sha256: {d}")
+
+    assert_true("plugin_digest_for" in case_body("verify_source_tree"),
+                "verify_source_tree does not consult the digest table")
+    assert_true("tree-digest" in case_body("verify_source_tree"),
+                "verify_source_tree does not digest the checked-out tree")
+
+
 def test_watchdog_and_installer_guards() -> None:
     qml = (HERE.parent / "Service.qml").read_text()
     assert_true("jobWatchdog" in qml and "job.running = false" in qml, "no Process watchdog")
@@ -769,13 +942,18 @@ def main() -> int:
         test_foreign_plugin_is_not_claimed_as_ours,
         test_confirmed_load_is_recorded_per_instance,
         test_cursor_theme_option_injection_refused,
+        test_tree_digest_is_canonical,
+        test_tree_digest_refuses_links_and_specials,
+        test_source_digest_gate_runs_before_make,
+        test_every_pin_has_a_source_digest,
         test_watchdog_and_installer_guards,
     ]
     failed = 0
     for test in tests:
         tmp = Path(tempfile.mkdtemp(prefix="stateio-test-"))
         try:
-            if test in (test_source_never_reopens_full_path, test_watchdog_and_installer_guards):
+            if test in (test_source_never_reopens_full_path, test_watchdog_and_installer_guards,
+                        test_every_pin_has_a_source_digest):
                 test()
             else:
                 test(tmp)

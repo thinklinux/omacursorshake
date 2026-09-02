@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import os
 import secrets
 import stat
@@ -29,6 +30,9 @@ NOFOLLOW = os.O_NOFOLLOW
 NONBLOCK = os.O_NONBLOCK
 MAX_COPY = 32 * 1024 * 1024
 MAX_REMOVE_DEPTH = 64
+MAX_DIGEST_BYTES = 256 * 1024 * 1024
+MAX_DIGEST_FILES = 50000
+DIGEST_SKIP = (".git",)
 LOCK_PREFIX = ".lock."
 LOCK_WAIT_SECONDS = 10.0
 GROUP_OTHER_WRITE = stat.S_IWGRP | stat.S_IWOTH
@@ -471,6 +475,89 @@ def exists_dir(path: str) -> bool:
     return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid()
 
 
+class DigestBudget:
+    """Bounds a tree digest in files and bytes so a hostile tree cannot stall it."""
+
+    def __init__(self) -> None:
+        self.files = 0
+        self.data = 0
+
+    def take_file(self, label: str) -> None:
+        self.files += 1
+        if self.files > MAX_DIGEST_FILES:
+            fail(f"source tree exceeds {MAX_DIGEST_FILES} files at: {label}")
+
+    def take_bytes(self, n: int, label: str) -> None:
+        self.data += n
+        if self.data > MAX_DIGEST_BYTES:
+            fail(f"source tree exceeds {MAX_DIGEST_BYTES} bytes at: {label}")
+
+
+def digest_file_at(dirfd: int, name: str, rel: str, h, budget: DigestBudget) -> None:
+    fd = open_reg_at(dirfd, name, rel)
+    try:
+        st = os.fstat(fd)
+        # The executable bit is the only mode git records, and it is the one
+        # that decides whether a file in the tree can be run.
+        mode = b"x" if st.st_mode & 0o111 else b"-"
+        h.update(b"f\0" + rel.encode() + b"\0" + mode + b"\0")
+        budget.take_file(rel)
+        size = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            budget.take_bytes(len(chunk), rel)
+            h.update(chunk)
+        h.update(b"\0" + str(size).encode() + b"\0")
+    finally:
+        os.close(fd)
+
+
+def digest_dir_fd(dirfd: int, prefix: str, h, budget: DigestBudget, depth: int) -> None:
+    """Hash a directory's contents in a canonical, platform-independent order."""
+    if depth > MAX_REMOVE_DEPTH:
+        fail(f"refusing to recurse past {MAX_REMOVE_DEPTH} levels: {prefix or '.'}")
+    for name in sorted(os.listdir(dirfd), key=lambda n: n.encode()):
+        valid_dirent_name(name)
+        rel = prefix + name
+        if depth == 0 and name in DIGEST_SKIP:
+            continue
+        lst = os.lstat(name, dir_fd=dirfd)
+        if stat.S_ISLNK(lst.st_mode):
+            fail(f"symlink in source tree: {rel}")
+        if stat.S_ISDIR(lst.st_mode):
+            h.update(b"d\0" + rel.encode() + b"\0")
+            childfd = openat_dir(dirfd, name, rel)
+            try:
+                digest_dir_fd(childfd, rel + "/", h, budget, depth + 1)
+            finally:
+                os.close(childfd)
+            continue
+        if not stat.S_ISREG(lst.st_mode):
+            fail(f"not a regular file: {rel}")
+        digest_file_at(dirfd, name, rel, h, budget)
+
+
+def tree_digest(path: str) -> str:
+    """SHA-256 over a source tree, independent of git's SHA-1 object names.
+
+    `.git` is skipped: it is metadata, not the source that make compiles, and
+    it is not byte-identical between clones. Symlinks are refused outright
+    rather than followed or recorded, so nothing outside the tree can be
+    hashed in or hidden behind a link.
+    """
+    dirfd = open_dir_walk(path)
+    try:
+        h = hashlib.sha256()
+        h.update(b"omacursorshake-tree-v1\0")
+        digest_dir_fd(dirfd, "", h, DigestBudget(), 0)
+        return h.hexdigest()
+    finally:
+        os.close(dirfd)
+
+
 def dir_ident(st: os.stat_result) -> tuple[int, int, int]:
     return (st.st_dev, st.st_ino, st.st_uid)
 
@@ -663,6 +750,11 @@ def main(argv: list[str]) -> int:
         if len(argv) != 3:
             fail("stateio exists <path>")
         return 0 if exists_reg(argv[2]) else 1
+    if cmd == "tree-digest":
+        if len(argv) != 3:
+            fail("stateio tree-digest <dir>")
+        sys.stdout.write(tree_digest(argv[2]) + "\n")
+        return 0
     if cmd == "is-dir":
         if len(argv) != 3:
             fail("stateio is-dir <path>")

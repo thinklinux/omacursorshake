@@ -237,6 +237,11 @@ require_commit_sha() {
   [[ $sha =~ ^[0-9a-f]{40}$ ]] || fail "hypr-dynamic-cursors pin must be a 40-character commit SHA (got: ${sha:-empty})"
 }
 
+require_sha256() {
+  local d=${1:-}
+  [[ $d =~ ^[0-9a-f]{64}$ ]] || fail "source digest must be 64 hex characters (got: ${d:-empty})"
+}
+
 # Hyprland commit -> hypr-dynamic-cursors commit (from upstream hyprpm.toml).
 # Unknown Hyprland versions fail; never fall back to a moving branch.
 plugin_rev_for() {
@@ -282,6 +287,39 @@ plugin_rev_for() {
   36b2e0cfe0c6094dbc47bd42a437431315bb3087) echo "f5ba36c7622098b53bf62ddb8ddf03b914abbdf8" ;; # 0.56.0
   5c9377c15f85c50648f35ca5a213754f95b93ca0) echo "f5ba36c7622098b53bf62ddb8ddf03b914abbdf8" ;; # 0.56.1
   efb50993780079460b0cbed1363e2166a2de1d9f) echo "5a224284872208b5324759d535d65061043725de" ;; # 0.56.2
+  *) echo "" ;;
+  esac
+}
+
+# hypr-dynamic-cursors commit -> SHA-256 of its source tree, as produced by
+# `stateio.py tree-digest` over the checkout with `.git` excluded.
+#
+# The commit SHA already binds the content, but only through git's SHA-1 and
+# only for as long as the object stays reachable on a branch: upstream
+# publishes no tags and no releases, so there is nothing immutable to point
+# at. This table is our own attestation of the bytes we reviewed, in a hash
+# git does not use, checked before anything is compiled. Regenerate and
+# re-verify it with `bin/verify_pins.py`.
+plugin_digest_for() {
+  case "${1:-}" in
+  f0409be76564171a97a792deabab3bd0528fe40c) echo "330ebd1b231fab0df2f9f50011f3e2b692d4acbc6f8c90f2ec1648f2efae3260" ;; # Hyprland 0.41.2
+  ddfea3a29c9badf6dabe12be86e4c5ba6d5507ad) echo "5c52af45427b153370880ff4c9adc226750cbe19b9a789bc869c49c01015c112" ;; # Hyprland 0.42.0-0.43.0
+  3ff4c2a053f7673b3b8cd45ada0886cbda13ebcc) echo "4da323a20fcbd6f28ac7f2cc6c532c29ba6abcc5a5cd88373aee5236c77013f1" ;; # Hyprland 0.44.0-0.44.1
+  81f4b964f997a3174596ef22c7a1dee8a5f616c7) echo "ba137f5e2fa49e2b044f25a8d8057882e10584b5bb32d2dca7a28d995fbf2918" ;; # Hyprland 0.45.0-0.45.2
+  111669a699f998b5eb5a0d5610b5fcb748aab038) echo "a6f96190bcc71d8115e96858a21922c0687ebad20e3d8e0902faedcc4351ec04" ;; # Hyprland 0.46.0-0.46.2
+  261bc1668f7de45b48ba6a40d5d727025575390b) echo "df4d1a2bcd21a016872670c3ab49776ce7b70644760ddc984ab82dc604428528" ;; # Hyprland 0.47.0-0.47.2
+  9f40dc905e5b7e00f0c00956a5c2b007b26c50c2) echo "d5da2b3e42dee07a8163f31e6fe71706aa86f3afb8e77b60a678ce2cbf39e327" ;; # Hyprland 0.48.0
+  2e7ea0224d8de63bb3ffead40e44248321b349bc) echo "51e61408f586279dd8ab483ed47101006607787ca5ee8324d90c2ee029e39c76" ;; # Hyprland 0.48.1
+  0e0e58ca95a58ea44896558409e0a151e7013fc0) echo "140aea67940b9a6f20d5496c475b726ca4a08df0a953ac7486c41892a7e13890" ;; # Hyprland 0.49.0
+  d6eb0b798c9b07f7f866647c8eb1d75a930501be) echo "8c2b3de1741afcd0f5402f64db41a2b8fece9d1541520ee85ed4c019d8052524" ;; # Hyprland 0.50.0-0.50.1
+  acac1f9a5c896ba934af1fc2414670c752ae529d) echo "8ed3888e1ad1224a0bebb795d2c8f53e15b97521abe10a063000ba6ed57cdff9" ;; # Hyprland 0.51.0-0.51.1
+  8c1679b87c54e97145cae83e622956d720e88bef) echo "ce6c1a4188425a7c7bf5a93fb38a8f83cfdc5acc770b9a8c4ea625853ca7b68f" ;; # Hyprland 0.52.0-0.52.2
+  7e9b7bc9fbcbb2f7f8985ec1f435b43021609639) echo "c44a99d644b0b8a4ea1a0e1e5eb30e589714582242df1420e2b88fdfeceba167" ;; # Hyprland 0.53.0-0.53.3
+  57e14edd0ae265b01828e466e287e96eb1e84dd3) echo "638b124ef12e2ac6b738edff96a3c248021ee20cd79f396ec2b6fe3cab9ca3d8" ;; # Hyprland 0.54.0-0.54.3
+  d195ab3ce94b0c983e04569a613361bff72be3d7) echo "8006d2c27233ed0f2f0155abaeda6cfcff824bc8ff2a0fcd5d20d44999d8ff88" ;; # Hyprland 0.55.0
+  da447486c84e0be81f2cdd208af1ef92469f0a88) echo "42c8c6164405ebd927b86d6b2acd951861a1020333a6aac7f2880382253722ae" ;; # Hyprland 0.55.1-0.55.4
+  f5ba36c7622098b53bf62ddb8ddf03b914abbdf8) echo "3ee62131ebe01492eb3c3d7c2b0ad7cc2ebed31e319df753154bc36ae2ba7e03" ;; # Hyprland 0.56.0-0.56.1
+  5a224284872208b5324759d535d65061043725de) echo "6af8c58d8c3a6887dab731a6bb28953679b55f43e500bb5827d6d5de68947b31" ;; # Hyprland 0.56.2
   *) echo "" ;;
   esac
 }
@@ -537,7 +575,7 @@ ensure_tree() {
 # The tree we are about to compile must be exactly the pinned commit, with
 # nothing extra in it for make to pick up.
 verify_source_tree() {
-  local want=$1 head="" dirty=""
+  local want=$1 head="" dirty="" want_digest="" got_digest=""
   head=$(capture_bounded 128 "$CHECKOUT_TIMEOUT" \
     git "${GIT_SAFE[@]}" -C "$SRC_DIR" rev-parse HEAD)
   head=$(sanitize_field "$head" 64)
@@ -545,6 +583,18 @@ verify_source_tree() {
   dirty=$(capture_bounded 4096 "$CHECKOUT_TIMEOUT" \
     git "${GIT_SAFE[@]}" -C "$SRC_DIR" status --porcelain --untracked-files=all)
   [[ -z $dirty ]] || fail "source tree is not clean after checkout; refusing to build"
+
+  # Everything above this line is git telling us about itself. The digest is
+  # the one check that reads the bytes make is about to compile, so it is what
+  # actually says the tree is the source we reviewed.
+  want_digest=$(plugin_digest_for "$want")
+  [[ -n $want_digest ]] || fail "no recorded source digest for hypr-dynamic-cursors $want"
+  require_sha256 "$want_digest"
+  got_digest=$(python3 "$STATEIO" tree-digest "$SRC_DIR") \
+    || fail "could not digest the source tree at $SRC_DIR"
+  got_digest=$(sanitize_field "${got_digest//$'\n'/}" 64)
+  [[ $got_digest == "$want_digest" ]] \
+    || fail "source tree digest is $got_digest, expected $want_digest for $want; refusing to build"
 }
 
 cmd_ensure() {

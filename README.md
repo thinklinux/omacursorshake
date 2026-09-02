@@ -41,6 +41,28 @@ Sensitivity, magnification, hold, and the on/off switch are saved in
 Removing the bar widget disables shake detection. Leave the icon on the bar
 if you want it to keep working.
 
+## Verifying the upstream pin
+
+Each supported Hyprland version maps to one hypr-dynamic-cursors commit, taken
+from upstream's `hyprpm.toml`. Alongside it this repo records the SHA-256 of
+that commit's source tree, and the build refuses to run `make` unless the
+checkout hashes to it.
+
+The commit SHA already names the content, but only through git's SHA-1 and only
+while the object stays reachable on a branch — upstream publishes no tags and
+no releases, so there is nothing immutable to point at. The digest table is
+this repo's own attestation of the bytes that were reviewed, in a hash git does
+not use, checked against the tree `make` is about to compile.
+
+```bash
+bin/verify_pins.py
+```
+
+That clones upstream and, for every pin, confirms the commit still resolves and
+is reachable, recomputes the digest with the same code the build uses, and
+diffs the whole Hyprland-to-plugin map against upstream's `hyprpm.toml`. It
+exits non-zero on any drift. `--print` emits a regenerated table.
+
 ## Uninstall
 
 ```bash
@@ -56,6 +78,8 @@ can be deleted too if you want it gone.
 - x86_64 only (Hyprland function hooks)
 - hypr-dynamic-cursors is fetched at a pinned commit for the running Hyprland
   version. Unsupported Hyprland versions fail instead of building `main`.
+  The checkout must match that commit, be clean, and hash to the recorded
+  SHA-256 of its source tree before anything is compiled.
 - A Hyprland update rebuilds the compositor plugin on next login (stamp
   mismatch). Do not overwrite the mapped `.so` while Hyprland has it loaded.
 - Only one copy of hypr-dynamic-cursors can be loaded. Hyprland does not report
