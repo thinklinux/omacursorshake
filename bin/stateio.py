@@ -706,11 +706,51 @@ def remove_tree(path: str) -> None:
     remove_tree_in(os.path.dirname(path), os.path.basename(path))
 
 
+# /proc/<pid>/maps, and test fixtures that look like it. Not a state-dir walk:
+# the compositor's maps file is root-owned. Fail closed and silent so a miss
+# cannot become a backend diagnostic.
+MAPS_MAX_BYTES = 8 * 1024 * 1024
+
+
+def maps_has(maps_path: str, so_path: str) -> bool:
+    """True if maps_path lists so_path as a mapped pathname, exactly."""
+    if not maps_path or not so_path:
+        return False
+    if not os.path.isabs(maps_path) or not os.path.isabs(so_path):
+        return False
+    if "\n" in so_path or "\0" in so_path or "\n" in maps_path or "\0" in maps_path:
+        return False
+    try:
+        fd = os.open(maps_path, os.O_RDONLY | NOFOLLOW | NONBLOCK | CLOEXEC)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        data = bytearray()
+        while len(data) < MAPS_MAX_BYTES:
+            try:
+                chunk = os.read(fd, min(65536, MAPS_MAX_BYTES - len(data)))
+            except OSError:
+                return False
+            if not chunk:
+                break
+            data.extend(chunk)
+    finally:
+        os.close(fd)
+    for line in data.decode("utf-8", "replace").splitlines():
+        parts = line.split(None, 5)
+        if len(parts) >= 6 and parts[5] == so_path:
+            return True
+    return False
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         fail(
             "stateio: usage: ensure-dir|read|read-tail|write|write-ring|copy|exists"
-            "|is-dir|rm-tree ..."
+            "|is-dir|rm-tree|maps-has ..."
         )
     cmd = argv[1]
     if cmd == "ensure-dir":
@@ -767,6 +807,10 @@ def main(argv: list[str]) -> int:
             remove_tree_in(argv[2], argv[3])
             return 0
         fail("stateio rm-tree <path> | rm-tree <state-dir> <name>")
+    if cmd == "maps-has":
+        if len(argv) != 4:
+            fail("stateio maps-has <maps-file> <so-path>")
+        return 0 if maps_has(argv[2], argv[3]) else 1
     fail(f"stateio: unknown command {cmd}")
     return 1
 

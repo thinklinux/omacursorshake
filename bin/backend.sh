@@ -336,11 +336,37 @@ record_load() {
   printf '%s\n' "$(hyprland_instance)" | secure_write "$LOADED_IN_PATH"
 }
 
+# PID of this compositor instance, as the compositor itself reports it.
+# The signature is a single path-safe token; anything else is not an instance.
+hyprland_pid() {
+  local sig pid
+  sig=$(hyprland_instance)
+  [[ $sig =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  pid=$(hyprctl_capture "$IPC_MAX_BYTES" -j instances \
+    | jq -r --arg sig "$sig" '
+      def entries: if type == "array" then .[] elif type == "object" then . else empty end;
+      [entries | select((.instance // "") | tostring == $sig) | (.pid // empty) | tostring]
+      | if length == 1 then .[0] else empty end
+    ' 2>/dev/null || true)
+  pid=$(sanitize_field "$pid" 16)
+  [[ $pid =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+# Hyprland 0.56's plugin listing has no path. The maps file does: if this
+# instance has our exact .so mapped, that copy is ours. A hyprpm build lives
+# at a different path and will not match. Misses fail closed (not mapped).
+so_is_mapped() {
+  local pid=""
+  pid=$(hyprland_pid) || return 1
+  python3 "$STATEIO" maps-has "/proc/${pid}/maps" "$SO_PATH" >/dev/null 2>&1
+}
+
 # Three-valued, because the truth is three-valued:
 #
-#   mine    - proven ours: the compositor reports a path that is our .so, or a
-#             name matches and we recorded a confirmed load in this same
-#             compositor instance.
+#   mine    - proven ours: the compositor reports a path that is our .so, our
+#             exact .so is mapped into this instance, or a name matches and we
+#             recorded a confirmed load in this same compositor instance.
 #   unknown - something matching is loaded, but nothing proves it is ours.
 #   none    - nothing matching is loaded.
 #
@@ -367,11 +393,15 @@ plugin_state() {
   case "$listed" in
   mine) printf 'mine\n' ;;
   unknown)
-    inst=$(hyprland_instance)
-    if [[ -n $inst && $inst == "$(recorded_instance)" ]]; then
+    if so_is_mapped; then
       printf 'mine\n'
     else
-      printf 'unknown\n'
+      inst=$(hyprland_instance)
+      if [[ -n $inst && $inst == "$(recorded_instance)" ]]; then
+        printf 'mine\n'
+      else
+        printf 'unknown\n'
+      fi
     fi
     ;;
   *) printf 'none\n' ;;
@@ -672,6 +702,10 @@ cmd_load() {
     # an instance identity. Say so plainly instead of reporting a false load
     # failure, or worse, claiming a load we cannot stand behind later.
     plugin_is_mine || emit_diag "omacursorshake: loaded, but this compositor instance has no identity (HYPRLAND_INSTANCE_SIGNATURE unset); status will keep reporting not-loaded"
+  else
+    # Already ours (listing path, mapped .so, or a prior record). Persist the
+    # instance id so a later name-only listing still counts as mine.
+    record_load
   fi
 
   eval_apply || true

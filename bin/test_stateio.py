@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import mmap
 import os
 import re
 import shutil
@@ -714,6 +715,79 @@ def test_foreign_plugin_is_not_claimed_as_ours(tmp: Path) -> None:
     assert_true(b"cannot prove is ours" in proc.stderr, f"err: {proc.stderr!r}")
 
 
+def test_maps_has_matches_exact_pathname(tmp: Path) -> None:
+    """A maps line counts only when the pathname is exactly our .so."""
+    so = tmp / "omarchy" / "omacursorshake" / "dynamic-cursors.so"
+    so.parent.mkdir(parents=True)
+    so.write_bytes(b"ELF-STUB\n")
+    other = tmp / "hyprpm" / "dynamic-cursors.so"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"OTHER\n")
+    maps = tmp / "maps"
+    maps.write_text(
+        "00400000-00401000 r-xp 00000000 00:00 1                          /usr/bin/Hyprland\n"
+        f"7f0000000000-7f0000001000 r-xp 00000000 00:1d 2                  {other}\n"
+        f"7f0000001000-7f0000002000 r-xp 00000000 00:1d 3                  {so} (deleted)\n"
+        f"7f0000002000-7f0000003000 r-xp 00000000 00:1d 4                  {so}.bak\n"
+        f"7f0000003000-7f0000004000 r-xp 00000000 00:1d 5                  {so}\n"
+    )
+    proc = run(["maps-has", str(maps), str(so)], check=False)
+    assert_true(proc.returncode == 0, f"exact path missed: {proc.stderr!r}")
+
+    maps.write_text(
+        "00400000-00401000 r-xp 00000000 00:00 1                          /usr/bin/Hyprland\n"
+        f"7f0000000000-7f0000001000 r-xp 00000000 00:1d 2                  {other}\n"
+        f"7f0000001000-7f0000002000 r-xp 00000000 00:1d 3                  {so} (deleted)\n"
+        f"7f0000002000-7f0000003000 r-xp 00000000 00:1d 4                  {so}.bak\n"
+    )
+    proc = run(["maps-has", str(maps), str(so)], check=False)
+    assert_true(proc.returncode != 0, "substring or (deleted) mapping was accepted")
+
+    proc = run(["maps-has", str(maps), str(other)], check=False)
+    assert_true(proc.returncode == 0, "foreign path should match itself")
+
+
+def test_mapped_so_is_claimed_as_ours(tmp: Path) -> None:
+    """A name-only listing is ours when this instance has our .so mapped.
+
+    Hyprland 0.56 omits plugin paths. After a shell restart the loaded-in
+    record can be missing even though our .so is still mapped; that must
+    not look like a foreign hyprpm copy.
+    """
+    env = _load_stub(tmp, "[]", load_exit=1)
+    env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
+    so = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake" / "dynamic-cursors.so"
+    fd = os.open(so, os.O_RDONLY)
+    mapping = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+    load_log = tmp / "hyprctl-load.log"
+    body = (
+        "#!/bin/sh\n"
+        f"echo \"$*\" >> {load_log}\n"
+        "case \"$*\" in\n"
+        "  *version*) printf '{\"commit\":\"efb50993780079460b0cbed1363e2166a2de1d9f\"}\\n' ;;\n"
+        f"  *instances*) printf '[{{\"instance\":\"test_instance\",\"pid\":{os.getpid()}}}]\\n' ;;\n"
+        "  *'plugin list'*) printf '[{\"name\":\"dynamic-cursors\"}]\\n' ;;\n"
+        "  *'plugin load'*) echo LOAD_ATTEMPTED >> \"$0.log\"; exit 1 ;;\n"
+        "  *) printf 'ok\\n' ;;\n"
+        "esac\n"
+    )
+    (tmp / "stubs" / "hyprctl").write_text(body)
+    try:
+        proc = _run_load(env)
+    finally:
+        mapping.close()
+        os.close(fd)
+    assert_true(proc.returncode == 0, f"mapped .so was not claimed: {proc.stderr!r}")
+    assert_true(b'"loaded": true' in proc.stdout, f"status: {proc.stdout!r}")
+    logged = load_log.read_text() if load_log.exists() else ""
+    assert_true("plugin load" not in logged, f"tried to load a second copy: {logged!r}")
+    state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
+    assert_true(
+        (state / "loaded-in").read_text().strip() == "test_instance",
+        "maps proof was not recorded for this instance",
+    )
+
+
 def test_confirmed_load_is_recorded_per_instance(tmp: Path) -> None:
     """The happy path still works, and the proof is scoped to one instance."""
     env = _load_stub(tmp / "ok", '[{"name":"dynamic-cursors"}]', load_exit=0)
@@ -940,6 +1014,8 @@ def main() -> int:
         test_checkout_must_match_the_pin,
         test_load_requires_hyprctl_exit_status,
         test_foreign_plugin_is_not_claimed_as_ours,
+        test_maps_has_matches_exact_pathname,
+        test_mapped_so_is_claimed_as_ours,
         test_confirmed_load_is_recorded_per_instance,
         test_cursor_theme_option_injection_refused,
         test_tree_digest_is_canonical,

@@ -83,9 +83,10 @@ can be deleted too if you want it gone.
 - A Hyprland update rebuilds the compositor plugin on next login (stamp
   mismatch). Do not overwrite the mapped `.so` while Hyprland has it loaded.
 - Only one copy of hypr-dynamic-cursors can be loaded. Hyprland does not report
-  plugin paths, so if another copy is already loaded (typically via `hyprpm`)
-  this plugin cannot prove which one is running and refuses to claim it. Run
-  `hyprpm remove hypr-dynamic-cursors` and restart the shell.
+  plugin paths. If our `.so` is already mapped into this compositor, that is
+  treated as proof and the plugin keeps using it. A different copy (typically
+  via `hyprpm`) stays unclaimed: run `hyprpm remove hypr-dynamic-cursors` and
+  restart the shell.
 - Every component of the state path must be a real directory owned by you (or
   root) and must not be group/other writable without the sticky bit. If
   `~/.local` or `~/.local/state` is group writable, `chmod go-w` it; otherwise
