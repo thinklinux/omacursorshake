@@ -433,10 +433,10 @@ def backend_section(name: str) -> str:
     return text[start : text.index("\n}\n", start)]
 
 
-def pipeline_version() -> int:
+def pipeline_version() -> int | None:
+    """None when backend.sh predates the build attestation."""
     m = re.search(r"^PIPELINE_VERSION=(\d+)$", BACKEND.read_text(), re.M)
-    assert_true(m is not None, "backend.sh declares no PIPELINE_VERSION")
-    return int(m.group(1))
+    return int(m.group(1)) if m else None
 
 
 def recorded_source_digest(rev: str) -> str:
@@ -454,8 +454,15 @@ def seed_attested_so(state: Path, content: bytes = b"ELF-STUB\n", **override) ->
     state.mkdir(parents=True, exist_ok=True)
     so = state / "dynamic-cursors.so"
     so.write_bytes(content)
+    pv = pipeline_version()
+    if pv is None:
+        # Backend predates the attestation, where existence was the whole gate.
+        # Returning a bare .so keeps these fixtures usable against the old code,
+        # so a regression test fails on the behaviour it is about rather than on
+        # its own setup.
+        return so
     stamp = {
-        "pipeline": pipeline_version(),
+        "pipeline": pv,
         "hyprland": HL_0562,
         "pluginRev": PIN_0562,
         "sourceDigest": recorded_source_digest(PIN_0562),
@@ -1071,7 +1078,16 @@ def test_attestation_mismatch_blocks_reuse_and_load(tmp: Path) -> None:
         ("foreign pin", {"pluginRev": "0" * 40}, None),
         ("wrong source digest", {"sourceDigest": "b" * 64}, None),
     ):
-        env = _load_stub(tmp / label.replace(" ", "-"), "[]", load_exit=0)
+        # A listing that lets an otherwise-legitimate load run to completion,
+        # so the attestation is the only thing that can refuse it. With "[]"
+        # a backend without the gate stops later on "no matching plugin is
+        # listed", which would prove nothing about the gate.
+        env = _load_stub(
+            tmp / label.replace(" ", "-"),
+            '[{"name":"dynamic-cursors"}]',
+            load_exit=0,
+        )
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
         state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
         if content is not None:
             # Stamp stays valid; only the file it attests changes.
