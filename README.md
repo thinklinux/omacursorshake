@@ -63,6 +63,24 @@ is reachable, recomputes the digest with the same code the build uses, and
 diffs the whole Hyprland-to-plugin map against upstream's `hyprpm.toml`. It
 exits non-zero on any drift. `--print` emits a regenerated table.
 
+During a build the source tree is pinned by an open directory descriptor. The
+digest, the compiler, and the copy of the finished `.so` all address that one
+descriptor, so the tree that is verified is provably the tree that is compiled
+— nothing re-resolves the path by name after the check.
+
+### What the build stamp records
+
+`built-for` is a JSON attestation, not just a Hyprland commit: it names the
+build-pipeline generation, the Hyprland commit, the pinned upstream commit, the
+verified source-tree digest, and the SHA-256 of the installed `.so`.
+
+The plugin reuses an existing binary only when all of that still holds *and*
+the file on disk still hashes to the recorded digest, and it re-checks the same
+thing immediately before handing the `.so` to Hyprland. Anything that does not
+match is rebuilt rather than trusted. A binary produced by an older pipeline —
+one that predates source-digest verification — is therefore rebuilt on upgrade
+instead of surviving untouched.
+
 ## Uninstall
 
 ```bash
@@ -81,7 +99,16 @@ can be deleted too if you want it gone.
   The checkout must match that commit, be clean, and hash to the recorded
   SHA-256 of its source tree before anything is compiled.
 - A Hyprland update rebuilds the compositor plugin on next login (stamp
-  mismatch). Do not overwrite the mapped `.so` while Hyprland has it loaded.
+  mismatch), as does any change to the recorded pin, the source digest, the
+  build-pipeline generation, or the installed binary's own bytes. Do not
+  overwrite the mapped `.so` while Hyprland has it loaded.
+- Building needs `/proc` mounted and coreutils 8.28+ (`env --chdir`), which is
+  how the source tree is pinned by descriptor across the build. The preflight
+  fails with that reason rather than falling back to resolving the path by
+  name.
+- Sensitivity, magnification, and hold are range-checked backend-side against
+  the same bounds the sliders enforce. A hand-edited `settings.json` outside
+  those bounds is refused rather than passed through to the compositor.
 - Only one copy of hypr-dynamic-cursors can be loaded. Hyprland does not report
   plugin paths. If our `.so` is already mapped into this compositor, that is
   treated as proof and the plugin keeps using it. A different copy (typically

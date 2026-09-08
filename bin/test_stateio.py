@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import mmap
 import os
 import re
@@ -396,7 +398,10 @@ STUB_TOOLS = {
     "make": (
         "#!/bin/sh\n"
         "echo \"make $*\" >&2\n"
-        "[ -n \"${STUB_ARGV_LOG:-}\" ] && echo \"make $*\" >> \"$STUB_ARGV_LOG\"\n"
+        "[ -n \"${STUB_ARGV_LOG:-}\" ] && echo \"make $* cwd=$(pwd -P)\" >> \"$STUB_ARGV_LOG\"\n"
+        # The build runs us via `env --chdir=/proc/self/fd/N`, so with no -C the
+        # artifact belongs in the current directory -- which is the pinned tree.
+        "dir=.\n"
         "while [ $# -gt 0 ]; do\n"
         "  case \"$1\" in -C) dir=$2; shift 2 ;; *) shift ;; esac\n"
         "done\n"
@@ -419,6 +424,46 @@ def stub_path(tmp: Path) -> str:
 
 
 PIN_0562 = "5a224284872208b5324759d535d65061043725de"
+HL_0562 = "efb50993780079460b0cbed1363e2166a2de1d9f"
+
+
+def backend_section(name: str) -> str:
+    text = BACKEND.read_text()
+    start = text.index(f"{name}() {{")
+    return text[start : text.index("\n}\n", start)]
+
+
+def pipeline_version() -> int:
+    m = re.search(r"^PIPELINE_VERSION=(\d+)$", BACKEND.read_text(), re.M)
+    assert_true(m is not None, "backend.sh declares no PIPELINE_VERSION")
+    return int(m.group(1))
+
+
+def recorded_source_digest(rev: str) -> str:
+    m = re.search(rf'{rev}\) echo "([0-9a-f]{{64}})"', backend_section("plugin_digest_for"))
+    assert_true(m is not None, f"no recorded source digest for {rev}")
+    return m.group(1)
+
+
+def seed_attested_so(state: Path, content: bytes = b"ELF-STUB\n", **override) -> Path:
+    """Install an .so plus the stamp attesting it, exactly as a build would.
+
+    Tests that only care about load behaviour need a *valid* attestation to get
+    past the gate; the gate itself is exercised by the tests that corrupt one.
+    """
+    state.mkdir(parents=True, exist_ok=True)
+    so = state / "dynamic-cursors.so"
+    so.write_bytes(content)
+    stamp = {
+        "pipeline": pipeline_version(),
+        "hyprland": HL_0562,
+        "pluginRev": PIN_0562,
+        "sourceDigest": recorded_source_digest(PIN_0562),
+        "soDigest": hashlib.sha256(content).hexdigest(),
+    }
+    stamp.update(override)
+    (state / "built-for").write_text(json.dumps(stamp) + "\n")
+    return so
 
 
 def tree_digest(path: Path) -> str:
@@ -475,9 +520,17 @@ def test_backend_build_pipeline(tmp: Path) -> None:
     so = sdir / "dynamic-cursors.so"
     assert_true(so.is_file(), "no .so installed")
     assert_true(so.stat().st_mode & 0o777 == 0o755, f"so mode {so.stat().st_mode:o}")
+    stamp = json.loads((sdir / "built-for").read_text())
+    assert_true(stamp["hyprland"] == HL_0562, f"stamp names the wrong Hyprland: {stamp}")
+    assert_true(stamp["pluginRev"] == PIN_0562, f"stamp names the wrong pin: {stamp}")
+    assert_true(stamp["pipeline"] == pipeline_version(), f"stamp pipeline: {stamp}")
     assert_true(
-        (sdir / "built-for").read_text().strip() == "efb50993780079460b0cbed1363e2166a2de1d9f",
-        "stamp not written",
+        stamp["sourceDigest"] == empty_tree_digest(tmp),
+        "stamp does not record the source digest that was verified",
+    )
+    assert_true(
+        stamp["soDigest"] == hashlib.sha256(so.read_bytes()).hexdigest(),
+        "stamp does not record the digest of the installed artifact",
     )
     status = proc.stdout.decode()
     assert_true('"needsRebuild": false' in status, f"status: {status}")
@@ -589,12 +642,13 @@ def test_gnumakefile_precedence_is_defeated(tmp: Path) -> None:
     assert_true((proj / "bad").exists(), "precondition: make should prefer GNUmakefile")
 
     (proj / "bad").unlink()
-    subprocess.run(["make", "-f", "Makefile", "-C", str(proj), "all"], check=True,
+    # Same shape the build uses: chdir through a descriptor, then -f Makefile.
+    subprocess.run(["env", f"--chdir={proj}", "make", "-f", "Makefile", "all"], check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     assert_true((proj / "ok").exists(), "-f Makefile did not run the intended file")
     assert_true(not (proj / "bad").exists(), "-f Makefile still ran GNUmakefile")
 
-    assert_true("make -f Makefile -C" in BACKEND.read_text(), "backend does not pin -f Makefile")
+    assert_true("make -f Makefile all" in BACKEND.read_text(), "backend does not pin -f Makefile")
 
 
 def test_planted_source_tree_is_destroyed(tmp: Path) -> None:
@@ -672,9 +726,7 @@ def _load_stub(tmp: Path, listed_after: str, load_exit: int) -> dict[str, str]:
     env = _hyprctl_stub(tmp, body)
     env["STUB_LOADED"] = str(tmp / "loaded-flag")
     env["STUB_LISTED_AFTER"] = listed_after
-    state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
-    state.mkdir(parents=True)
-    (state / "dynamic-cursors.so").write_bytes(b"ELF-STUB\n")
+    seed_attested_so(Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake")
     return env
 
 
@@ -979,6 +1031,147 @@ def test_every_pin_has_a_source_digest() -> None:
                 "verify_source_tree does not digest the checked-out tree")
 
 
+def test_legacy_stamp_forces_a_rebuild(tmp: Path) -> None:
+    """An .so from a pipeline that never digested its source must not survive.
+
+    <=1.0.14 stamped only the Hyprland commit, so upgrading left an artifact
+    built without any source verification in place and cmd_ensure short-
+    circuited straight past it. The stamp now names the pipeline generation.
+    """
+    state = tmp / "state"
+    sdir = state / "omarchy" / "omacursorshake"
+    sdir.mkdir(parents=True)
+    (sdir / "dynamic-cursors.so").write_bytes(b"OLD-UNVERIFIED-ARTIFACT\n")
+    # Exactly what the old code wrote: the Hyprland commit, nothing else.
+    (sdir / "built-for").write_text(HL_0562 + "\n")
+
+    env = backend_env(tmp, state)
+    argv_log = tmp / "make-ran.log"
+    env["STUB_ARGV_LOG"] = str(argv_log)
+    backend = patched_backend(tmp, empty_tree_digest(tmp))
+    proc = subprocess.run(
+        ["bash", str(backend), "ensure"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
+    assert_true(argv_log.exists(), "legacy stamp was accepted; the old .so was never rebuilt")
+    assert_true(
+        (sdir / "dynamic-cursors.so").read_bytes() != b"OLD-UNVERIFIED-ARTIFACT\n",
+        "the unverified artifact is still installed",
+    )
+    stamp = json.loads((sdir / "built-for").read_text())
+    assert_true(stamp["pipeline"] == pipeline_version(), f"stamp not upgraded: {stamp}")
+
+
+def test_attestation_mismatch_blocks_reuse_and_load(tmp: Path) -> None:
+    """Every field of the stamp gates both reuse and the dlopen."""
+    for label, override, content in (
+        ("tampered bytes", {}, b"REPLACED-AFTER-INSTALL\n"),
+        ("stale pipeline", {"pipeline": 1}, None),
+        ("foreign pin", {"pluginRev": "0" * 40}, None),
+        ("wrong source digest", {"sourceDigest": "b" * 64}, None),
+    ):
+        env = _load_stub(tmp / label.replace(" ", "-"), "[]", load_exit=0)
+        state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
+        if content is not None:
+            # Stamp stays valid; only the file it attests changes.
+            (state / "dynamic-cursors.so").write_bytes(content)
+        else:
+            seed_attested_so(state, **override)
+        proc = _run_load(env)
+        assert_true(proc.returncode != 0, f"{label}: load was allowed")
+        assert_true(
+            b"build attestation" in proc.stderr,
+            f"{label}: wrong failure: {proc.stderr!r}",
+        )
+        assert_true(
+            b'"loaded": true' not in proc.stdout, f"{label}: reported loaded"
+        )
+
+
+def test_substring_path_is_not_claimed_as_ours(tmp: Path) -> None:
+    """A listed path that merely contains ours is a different binary."""
+    env = _load_stub(tmp / "substr", "[]", load_exit=0)
+    state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
+    ours = str(state / "dynamic-cursors.so")
+    Path(env["STUB_LOADED"]).touch()
+    for decoy in (ours + ".bak", "/opt/vendor" + ours):
+        env["STUB_LISTED_AFTER"] = json.dumps([{"name": "dynamic-cursors", "path": decoy}])
+        proc = _run_load(env)
+        assert_true(proc.returncode != 0, f"{decoy} was claimed as ours")
+        assert_true(b"cannot prove is ours" in proc.stderr, f"err: {proc.stderr!r}")
+
+
+def test_settings_ranges_are_enforced(tmp: Path) -> None:
+    """Shape is not range: a hand-edited settings.json must not reach hl.config()."""
+    env = _load_stub(tmp / "ranges", "[]", load_exit=0)
+    state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
+    for payload, field in (
+        ('{"enabled":true,"base":999}', b"base"),
+        ('{"enabled":true,"base":0}', b"base"),
+        ('{"enabled":true,"threshold":0}', b"threshold"),
+        ('{"enabled":true,"threshold":999.999}', b"threshold"),
+        ('{"enabled":true,"timeout":60000}', b"timeout"),
+    ):
+        proc = subprocess.run(
+            ["bash", str(BACKEND), "apply", payload],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+        )
+        assert_true(proc.returncode != 0, f"{payload} was accepted")
+        assert_true(field in proc.stderr, f"{payload}: wrong error {proc.stderr!r}")
+        assert_true(
+            not (state / "apply.lua").exists(),
+            f"{payload} reached apply.lua",
+        )
+    # The values the sliders actually produce must still pass.
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "apply", '{"enabled":true,"threshold":8,"base":3,"timeout":3000}'],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode == 0, f"in-range settings refused: {proc.stderr!r}")
+    assert_true((state / "apply.lua").is_file(), "apply.lua not written for valid settings")
+
+
+def test_source_tree_is_pinned_by_descriptor(tmp: Path) -> None:
+    """Digest, compile, and install must all address one held descriptor.
+
+    Re-resolving $SRC_DIR by name after the digest left a window in which the
+    verified tree could be swapped for another before make read it.
+    """
+    body = backend_section("cmd_ensure")
+    assert_true("exec {srcfd}<" in body, "source tree is not pinned by descriptor")
+    assert_true("tree-digest-fd" in body or "tree-digest-fd" in backend_section(
+        "verify_source_tree"), "digest does not use the pinned descriptor")
+    assert_true("env --chdir=" in body, "make is not run through the pinned descriptor")
+    assert_true(
+        'make -f Makefile -C "$SRC_DIR"' not in BACKEND.read_text()
+        and 'copy" "$SRC_DIR' not in BACKEND.read_text(),
+        "a build step still re-resolves $SRC_DIR by name",
+    )
+
+    # Functional proof: swap the directory out from under the open fd and the
+    # artifact still comes from the inode that was verified.
+    real, evil = tmp / "real", tmp / "evil"
+    (real / "out").mkdir(parents=True)
+    (evil / "out").mkdir(parents=True)
+    (real / "out" / "dynamic-cursors.so").write_bytes(b"VERIFIED\n")
+    (evil / "out" / "dynamic-cursors.so").write_bytes(b"SWAPPED\n")
+    dest = tmp / "state" / "dynamic-cursors.so"
+    dest.parent.mkdir(parents=True)
+    script = (
+        'exec {fd}<"$1"; mv "$1" "$1.gone"; mv "$4" "$1"; '
+        'exec python3 "$2" copy-fd $fd out/dynamic-cursors.so "$3" 0755'
+    )
+    subprocess.run(
+        ["bash", "-c", script, "_", str(real), str(STATEIO), str(dest), str(evil)],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+    )
+    assert_true(
+        dest.read_bytes() == b"VERIFIED\n",
+        f"a directory swap redirected the install: {dest.read_bytes()!r}",
+    )
+
+
 def test_watchdog_and_installer_guards() -> None:
     qml = (HERE.parent / "Service.qml").read_text()
     assert_true("jobWatchdog" in qml and "job.running = false" in qml, "no Process watchdog")
@@ -1022,6 +1215,11 @@ def main() -> int:
         test_tree_digest_refuses_links_and_specials,
         test_source_digest_gate_runs_before_make,
         test_every_pin_has_a_source_digest,
+        test_legacy_stamp_forces_a_rebuild,
+        test_attestation_mismatch_blocks_reuse_and_load,
+        test_substring_path_is_not_claimed_as_ours,
+        test_settings_ranges_are_enforced,
+        test_source_tree_is_pinned_by_descriptor,
         test_watchdog_and_installer_guards,
     ]
     failed = 0

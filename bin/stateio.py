@@ -12,6 +12,12 @@ opened with O_NOFOLLOW|O_NONBLOCK via dir_fd and fstat'd. Writes use an
 O_EXCL temporary in the already-opened directory, held open through
 write, fsync, and rename. Removal unlinks with dir_fd, is depth-bounded,
 and refuses mount or identity changes.
+
+The build path additionally pins the source tree by descriptor: backend.sh
+opens $SRC_DIR once and passes the inherited fd number, so the tree that is
+digested is byte-for-byte the tree that `make` compiles and the tree the
+built artifact is copied out of. Nothing in that sequence re-resolves the
+directory by name, so it cannot be swapped between verification and use.
 """
 
 from __future__ import annotations
@@ -558,6 +564,115 @@ def tree_digest(path: str) -> str:
         os.close(dirfd)
 
 
+def inherited_dir_fd(raw: str) -> int:
+    """Validate an fd number handed to us by backend.sh via inheritance.
+
+    The caller opened the directory once with O_NOFOLLOW and keeps it open for
+    the whole build. We never re-resolve that directory by name, so no other
+    process can substitute it between the digest and the compiler.
+    """
+    try:
+        fd = int(raw, 10)
+    except ValueError:
+        fail(f"not an fd number: {raw}")
+    if fd < 0:
+        fail(f"not an fd number: {raw}")
+    try:
+        st = os.fstat(fd)
+    except OSError as exc:
+        fail(f"inherited fd {fd} is not usable ({exc.strerror})")
+    if not stat.S_ISDIR(st.st_mode):
+        fail(f"inherited fd {fd} is not a directory")
+    if st.st_uid != os.getuid():
+        fail(f"inherited fd {fd} is not owned by the current user")
+    return fd
+
+
+def tree_digest_at(fd: int) -> str:
+    """tree_digest over an already-open, caller-pinned directory descriptor."""
+    h = hashlib.sha256()
+    h.update(b"omacursorshake-tree-v1\0")
+    digest_dir_fd(fd, "", h, DigestBudget(), 0)
+    return h.hexdigest()
+
+
+def open_rel_at(dirfd: int, rel: str) -> int:
+    """Open a relative regular file below a pinned directory descriptor.
+
+    Every intermediate component is walked with O_NOFOLLOW from the pinned fd,
+    so neither the directory nor the file can be redirected by a symlink.
+    """
+    parts = [p for p in rel.split("/") if p != ""]
+    if not parts:
+        fail(f"invalid relative path: {rel}")
+    for p in parts:
+        valid_dirent_name(p)
+    cur = os.dup(dirfd)
+    try:
+        for name in parts[:-1]:
+            nextfd = openat_dir(cur, name, name)
+            os.close(cur)
+            cur = nextfd
+        return open_reg_at(cur, parts[-1], rel)
+    finally:
+        os.close(cur)
+
+
+def hash_fd(fd: int, label: str, max_bytes: int) -> str:
+    h = hashlib.sha256()
+    total = 0
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            fail(f"file exceeds {max_bytes}-byte digest limit: {label}")
+        h.update(chunk)
+    return h.hexdigest()
+
+
+def file_digest(path: str) -> str:
+    """SHA-256 of one state file, read through the O_NOFOLLOW walk."""
+    parent, name = split_leaf(path)
+    try:
+        dirfd = walk_dir(parent, create=False)
+    except FileNotFoundError:
+        fail(f"missing file: {path}")
+    try:
+        try:
+            fd = open_reg_at(dirfd, name, path)
+        except FileNotFoundError:
+            fail(f"missing file: {path}")
+        try:
+            return hash_fd(fd, path, MAX_COPY)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dirfd)
+
+
+def copy_from_dir_fd(srcfd: int, rel: str, dest: str, mode: int) -> str:
+    """Publish a build artifact read only through the pinned source fd.
+
+    Returns the SHA-256 of the bytes actually published. The caller records
+    that in the build stamp, so the attestation covers the exact content that
+    was installed rather than whatever a later read of the destination finds.
+    """
+    try:
+        fd = open_rel_at(srcfd, rel)
+    except FileNotFoundError:
+        fail(f"build finished but {rel} is missing or not a regular file")
+    try:
+        data = read_fd(fd, MAX_COPY + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_COPY:
+        fail(f"file exceeds {MAX_COPY}-byte copy limit: {rel}")
+    write_file(dest, data, mode)
+    return hashlib.sha256(data).hexdigest()
+
+
 def dir_ident(st: os.stat_result) -> tuple[int, int, int]:
     return (st.st_dev, st.st_ino, st.st_uid)
 
@@ -749,8 +864,8 @@ def maps_has(maps_path: str, so_path: str) -> bool:
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         fail(
-            "stateio: usage: ensure-dir|read|read-tail|write|write-ring|copy|exists"
-            "|is-dir|rm-tree|maps-has ..."
+            "stateio: usage: ensure-dir|read|read-tail|write|write-ring|copy|copy-fd"
+            "|exists|is-dir|rm-tree|maps-has|tree-digest|tree-digest-fd|file-digest ..."
         )
     cmd = argv[1]
     if cmd == "ensure-dir":
@@ -794,6 +909,24 @@ def main(argv: list[str]) -> int:
         if len(argv) != 3:
             fail("stateio tree-digest <dir>")
         sys.stdout.write(tree_digest(argv[2]) + "\n")
+        return 0
+    if cmd == "tree-digest-fd":
+        if len(argv) != 3:
+            fail("stateio tree-digest-fd <fd>")
+        sys.stdout.write(tree_digest_at(inherited_dir_fd(argv[2])) + "\n")
+        return 0
+    if cmd == "file-digest":
+        if len(argv) != 3:
+            fail("stateio file-digest <path>")
+        sys.stdout.write(file_digest(argv[2]) + "\n")
+        return 0
+    if cmd == "copy-fd":
+        if len(argv) not in (5, 6):
+            fail("stateio copy-fd <src-dir-fd> <relative-path> <dest> [mode]")
+        mode = int(argv[5], 8) if len(argv) == 6 else 0o600
+        sys.stdout.write(
+            copy_from_dir_fd(inherited_dir_fd(argv[2]), argv[3], argv[4], mode) + "\n"
+        )
         return 0
     if cmd == "is-dir":
         if len(argv) != 3:

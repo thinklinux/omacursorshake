@@ -33,6 +33,14 @@ GIT_SAFE=(
   -c protocol.file.allow=never
   -c protocol.ext.allow=never
 )
+# Generation of the build-and-attest pipeline. The stamp records it alongside
+# the digests, and cmd_ensure refuses to reuse an .so that was not produced by
+# the current generation. Bump this whenever a change to the build path makes
+# an older artifact no longer trustworthy: a plain-SHA stamp from <=1.0.14, or
+# any future weakening, then forces a rebuild instead of silently surviving an
+# upgrade. Without it the digest attestation would only ever cover fresh
+# installs.
+PIPELINE_VERSION=2
 DIAG_BYTES=2048
 LOG_BUDGET=65536
 IPC_TIMEOUT=5
@@ -232,6 +240,23 @@ hyprland_instance() {
   sanitize_field "$sig" 128
 }
 
+# Inclusive decimal range check. Bash has no float comparison; the caller's
+# shape regex guarantees at most 3 integer and 3 fraction digits, so scale
+# both parts to thousandths and compare as integers. 10# keeps a leading-zero
+# field ("050") decimal rather than an invalid octal literal.
+require_range() {
+  local name=$1 v=$2 lo=$3 hi=$4 int frac scaled
+  int=${v%%.*}
+  frac=000
+  if [[ $v == *.* ]]; then
+    frac=${v#*.}
+    while (( ${#frac} < 3 )); do frac="${frac}0"; done
+  fi
+  scaled=$(( 10#$int * 1000 + 10#$frac ))
+  (( scaled >= lo * 1000 && scaled <= hi * 1000 )) \
+    || fail "settings.$name must be between $lo and $hi (got $v)"
+}
+
 require_commit_sha() {
   local sha=${1:-}
   [[ $sha =~ ^[0-9a-f]{40}$ ]] || fail "hypr-dynamic-cursors pin must be a 40-character commit SHA (got: ${sha:-empty})"
@@ -324,6 +349,70 @@ plugin_digest_for() {
   esac
 }
 
+# --- build attestation stamp -------------------------------------------------
+#
+# The stamp is a JSON record of what produced the installed .so, not merely
+# which Hyprland it was built for. A bare Hyprland SHA let an artifact built by
+# an older, weaker pipeline survive an upgrade untouched: the short-circuit in
+# cmd_ensure matched, no rebuild happened, and the digest attestation this
+# plugin is built around never applied to it. Every field must match, and the
+# file on disk must still hash to the recorded digest, before the .so is
+# reused or handed to the compositor.
+
+read_stamp() {
+  secure_read "$STAMP_PATH" 4096 2>/dev/null || true
+}
+
+stamp_field() {
+  local v=""
+  v=$(jq -r --arg k "$2" '.[$k] // empty | tostring' <<<"$1" 2>/dev/null || true)
+  sanitize_field "${v//$'\n'/}" 128
+}
+
+write_stamp() {
+  ensure_state_dir
+  jq -n \
+    --argjson pipeline "$PIPELINE_VERSION" \
+    --arg hyprland "$1" \
+    --arg pluginRev "$2" \
+    --arg sourceDigest "$3" \
+    --arg soDigest "$4" \
+    '{
+      pipeline: $pipeline,
+      hyprland: $hyprland,
+      pluginRev: $pluginRev,
+      sourceDigest: $sourceDigest,
+      soDigest: $soDigest
+    }' | secure_write "$STAMP_PATH"
+}
+
+so_digest() {
+  local d=""
+  d=$(python3 "$STATEIO" file-digest "$SO_PATH" 2>/dev/null || true)
+  sanitize_field "${d//$'\n'/}" 64
+}
+
+# True only when the installed .so is the artifact this pipeline generation
+# built, from the source tree whose digest we attested, for this Hyprland and
+# this pinned upstream commit -- and the bytes on disk still hash to it.
+# A legacy plain-SHA stamp has no fields and fails here, forcing a rebuild.
+so_attested_for() {
+  local hl=$1 rev=$2 raw="" want_src="" recorded=""
+  [[ -n $hl && -n $rev ]] || return 1
+  raw=$(read_stamp)
+  [[ -n $raw ]] || return 1
+  [[ $(stamp_field "$raw" pipeline) == "$PIPELINE_VERSION" ]] || return 1
+  [[ $(stamp_field "$raw" hyprland) == "$hl" ]] || return 1
+  [[ $(stamp_field "$raw" pluginRev) == "$rev" ]] || return 1
+  want_src=$(plugin_digest_for "$rev")
+  [[ -n $want_src ]] || return 1
+  [[ $(stamp_field "$raw" sourceDigest) == "$want_src" ]] || return 1
+  recorded=$(stamp_field "$raw" soDigest)
+  [[ $recorded =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ $(so_digest) == "$recorded" ]] || return 1
+  return 0
+}
+
 recorded_instance() {
   local v=""
   v=$(secure_read "$LOADED_IN_PATH" 256 2>/dev/null || true)
@@ -384,7 +473,11 @@ plugin_state() {
     def entries: if type == "array" then .[] elif type == "object" then . else empty end;
     def pathof: (.path // .filename // "") | tostring;
     def nameof: (.name // .plugin // .handle // "") | tostring;
-    if any(entries; pathof != "" and (pathof | contains($so))) then "mine"
+    # Exact equality, never a substring: a sibling ".so.bak" or a copy under a
+    # longer prefix contains our path but is not our build, and treating it as
+    # ours would push our config into a binary we never verified. This matches
+    # the exact-pathname rule stateio.py maps-has applies to /proc/<pid>/maps.
+    if any(entries; pathof == $so) then "mine"
     elif any(entries; nameof | test("dynamic-cursors"; "i")) then "unknown"
     else "none"
     end
@@ -419,13 +512,12 @@ plugin_present() {
   [[ $(plugin_state) != none ]]
 }
 
-# Replace the directory entry, never truncate a mapped inode.
-# The compiler output is a predictable path: read it without following
-# a symlink, then publish the bytes through a same-directory temporary.
-install_so() {
-  local src=$1
-  ensure_state_dir
-  python3 "$STATEIO" copy "$src" "$SO_PATH" 0755
+# Replace the directory entry, never truncate a mapped inode. The compiler
+# output is read relative to the pinned source descriptor, so the artifact we
+# install is the one built from the tree we digested, then published through a
+# same-directory temporary.
+install_so_from() {
+  python3 "$STATEIO" copy-fd "$1" "$2" "$SO_PATH" 0755
 }
 
 # QML FileView writes are async; jobs pass a JSON snapshot as $2 so disable
@@ -461,7 +553,14 @@ write_apply_lua() {
   [[ $threshold =~ ^[0-9]{1,3}([.][0-9]{1,3})?$ ]] || fail "settings.threshold must be a number"
   [[ $base =~ ^[0-9]{1,3}([.][0-9]{1,3})?$ ]] || fail "settings.base must be a number"
   [[ $timeout =~ ^[0-9]{1,6}$ ]] || fail "settings.timeout must be an integer"
-  (( timeout >= 100 && timeout <= 60000 )) || fail "settings.timeout must be 100-60000 ms"
+  # Range, not just shape, and for every field the compositor consumes. The
+  # shape regexes alone admit 0-999.999, so a hand-edited settings.json could
+  # push a ~999x magnification or a zero shake threshold straight through
+  # hl.config(). These bounds are the ones the QML sliders enforce, so a
+  # normalized snapshot always passes and only a hand-edited file can trip it.
+  require_range threshold "$threshold" 4 8
+  require_range base "$base" 3 6
+  (( timeout >= 1000 && timeout <= 3000 )) || fail "settings.timeout must be 1000-3000 ms"
 
   # Default simulation mode is tilt. hl.config() updates the Hyprlang store
   # but CVariantProp keeps the live MODE until activate() (setShape or a
@@ -550,18 +649,25 @@ cmd_status() {
   arch=$(capture_bounded 64 5 uname -m)
   hl_commit=$(hyprland_commit)
   hl_ver=$(hyprland_version)
-  built=$(secure_read "$STAMP_PATH" 128 || true)
-  built=$(sanitize_field "${built//$'\n'/}" 64)
+  local plugin_rev=""
+  plugin_rev=$(plugin_rev_for "$hl_commit")
+  # builtFor reports the Hyprland the current attestation names. A legacy
+  # plain-SHA stamp has no such field and reads empty, which is accurate:
+  # nothing about that artifact is attested any more.
+  built=$(stamp_field "$(read_stamp)" hyprland)
+  built=$(sanitize_field "$built" 64)
   so_exists=false
   python3 "$STATEIO" exists "$SO_PATH" && so_exists=true
   loaded=false
   # Only a proven-ours plugin counts as loaded. "unknown" is reported as false
   # rather than dressed up as success.
   plugin_is_mine && loaded=true
+  # Same rule the build path uses, so the UI never shows an up-to-date plugin
+  # that cmd_ensure would in fact rebuild.
   needs=false
   if [[ $arch != x86_64 ]]; then
     needs=false
-  elif [[ $so_exists != true || -z $built || $built != "$hl_commit" ]]; then
+  elif [[ $so_exists != true ]] || ! so_attested_for "$hl_commit" "$plugin_rev"; then
     needs=true
   fi
   jq -n \
@@ -572,7 +678,7 @@ cmd_status() {
     --arg builtFor "$built" \
     --arg hyprlandCommit "$hl_commit" \
     --arg hyprlandVersion "$hl_ver" \
-    --arg pluginRev "$(plugin_rev_for "$hl_commit")" \
+    --arg pluginRev "$plugin_rev" \
     --argjson needsRebuild "$needs" \
     --argjson loaded "$loaded" \
     --arg settingsPath "$SETTINGS_PATH" \
@@ -599,19 +705,30 @@ ensure_tree() {
   command -v g++ >/dev/null || fail "g++ is required to build hypr-dynamic-cursors"
   command -v timeout >/dev/null || fail "timeout (coreutils) is required to bound git/make"
   command -v python3 >/dev/null || fail "python3 is required to cap build-log size"
+  # The build runs the compiler through a pinned directory descriptor, which
+  # needs env --chdir (coreutils 8.28+). Fail here with a clear cause rather
+  # than mid-build, and never silently fall back to resolving $SRC_DIR by name.
+  env --chdir=/ true >/dev/null 2>&1 \
+    || fail "env --chdir (coreutils 8.28+) is required to pin the source tree during the build"
+  [[ -r /proc/self/fd ]] || fail "/proc must be mounted to pin the source tree during the build"
   pkg-config --exists hyprland || fail "pkg-config hyprland is missing; install the hyprland package"
 }
 
 # The tree we are about to compile must be exactly the pinned commit, with
 # nothing extra in it for make to pick up.
+#
+# Everything here addresses the pinned descriptor ($2 is the fd, $3 the
+# /proc/self/fd path that resolves through it), never $SRC_DIR by name, so the
+# tree that is verified is provably the same inode the compiler then reads.
+# Echoes the verified source digest on stdout for the stamp.
 verify_source_tree() {
-  local want=$1 head="" dirty="" want_digest="" got_digest=""
+  local want=$1 srcfd=$2 pin=$3 head="" dirty="" want_digest="" got_digest=""
   head=$(capture_bounded 128 "$CHECKOUT_TIMEOUT" \
-    git "${GIT_SAFE[@]}" -C "$SRC_DIR" rev-parse HEAD)
+    git "${GIT_SAFE[@]}" -C "$pin" rev-parse HEAD)
   head=$(sanitize_field "$head" 64)
   [[ $head == "$want" ]] || fail "checkout is '${head:-empty}', expected the pinned $want"
   dirty=$(capture_bounded 4096 "$CHECKOUT_TIMEOUT" \
-    git "${GIT_SAFE[@]}" -C "$SRC_DIR" status --porcelain --untracked-files=all)
+    git "${GIT_SAFE[@]}" -C "$pin" status --porcelain --untracked-files=all)
   [[ -z $dirty ]] || fail "source tree is not clean after checkout; refusing to build"
 
   # Everything above this line is git telling us about itself. The digest is
@@ -620,11 +737,12 @@ verify_source_tree() {
   want_digest=$(plugin_digest_for "$want")
   [[ -n $want_digest ]] || fail "no recorded source digest for hypr-dynamic-cursors $want"
   require_sha256 "$want_digest"
-  got_digest=$(python3 "$STATEIO" tree-digest "$SRC_DIR") \
+  got_digest=$(python3 "$STATEIO" tree-digest-fd "$srcfd") \
     || fail "could not digest the source tree at $SRC_DIR"
   got_digest=$(sanitize_field "${got_digest//$'\n'/}" 64)
   [[ $got_digest == "$want_digest" ]] \
     || fail "source tree digest is $got_digest, expected $want_digest for $want; refusing to build"
+  printf '%s\n' "$got_digest"
 }
 
 cmd_ensure() {
@@ -639,10 +757,12 @@ cmd_ensure() {
   # Conservative on purpose: any matching plugin may have our .so mapped.
   plugin_present && was_loaded=true
 
-  local built_for=""
-  built_for=$(secure_read "$STAMP_PATH" 128 || true)
-  built_for=$(sanitize_field "${built_for//$'\n'/}" 64)
-  if (( force == 0 )) && python3 "$STATEIO" exists "$SO_PATH" && [[ $built_for == "$hl_commit" ]]; then
+  # Reuse the installed .so only when its full attestation still holds. An
+  # artifact whose stamp predates this pipeline generation, names a different
+  # upstream commit, records a source digest we no longer vouch for, or whose
+  # bytes have changed since install, is rebuilt rather than trusted.
+  if (( force == 0 )) && python3 "$STATEIO" exists "$SO_PATH" \
+     && so_attested_for "$hl_commit" "$plugin_rev"; then
     cmd_status
     return 0
   fi
@@ -660,23 +780,52 @@ cmd_ensure() {
 
   run_timed "$FETCH_TIMEOUT" git "${GIT_SAFE[@]}" -C "$SRC_DIR" fetch --force origin "$plugin_rev"
   run_timed "$CHECKOUT_TIMEOUT" git "${GIT_SAFE[@]}" -C "$SRC_DIR" checkout --detach "$plugin_rev"
-  verify_source_tree "$plugin_rev"
-  # -f Makefile: never let a GNUmakefile take precedence.
-  run_timed "$MAKE_TIMEOUT" make -f Makefile -C "$SRC_DIR" all
-  python3 "$STATEIO" exists "$SRC_DIR/out/dynamic-cursors.so" \
-    || fail "build finished but $SRC_DIR/out/dynamic-cursors.so is missing or not a regular file"
+
+  # Pin the source tree by descriptor for the rest of the build. Until now
+  # every git step addressed $SRC_DIR by name; from here nothing does. Children
+  # inherit the fd, so /proc/self/fd/$srcfd resolves through our own open
+  # descriptor inside git, python3, and make alike, and the inode that is
+  # digested is provably the inode the compiler reads and the artifact is
+  # copied out of. Re-resolving the name at any of those steps would leave a
+  # window for a same-uid process to swap the directory after verification.
+  local srcfd="" src_pin="" src_digest=""
+  exec {srcfd}<"$SRC_DIR" || fail "could not pin the source tree at $SRC_DIR"
+  src_pin="/proc/self/fd/$srcfd"
+  src_digest=$(verify_source_tree "$plugin_rev" "$srcfd" "$src_pin")
+  require_sha256 "$src_digest"
+  # -f Makefile: never let a GNUmakefile take precedence. --chdir rather than
+  # make -C so the Makefile sees a real getcwd() and not the /proc alias.
+  run_timed "$MAKE_TIMEOUT" env --chdir="$src_pin" make -f Makefile all
 
   if [[ $was_loaded == true ]]; then
     emit_diag "omacursorshake: plugin is loaded; installing beside the mapped inode"
   fi
-  install_so "$SRC_DIR/out/dynamic-cursors.so"
-  printf '%s\n' "$hl_commit" | secure_write "$STAMP_PATH"
+  # The digest comes back from the process that published the bytes, not from
+  # a second read of the destination: re-reading SO_PATH here would leave a
+  # window in which the stamp could end up attesting someone else's file.
+  local so_sha=""
+  so_sha=$(install_so_from "$srcfd" out/dynamic-cursors.so)
+  so_sha=$(sanitize_field "${so_sha//$'\n'/}" 64)
+  require_sha256 "$so_sha"
+  exec {srcfd}<&-
+
+  write_stamp "$hl_commit" "$plugin_rev" "$src_digest" "$so_sha"
   cmd_status
 }
 
 cmd_load() {
   ingest_settings_json "${1:-}"
   python3 "$STATEIO" exists "$SO_PATH" || fail "plugin is not built yet"
+
+  # About to hand this file to the compositor to dlopen. Existence and
+  # ownership say nothing about its content, so re-check the full attestation
+  # against the bytes on disk immediately before the load. Anything that no
+  # longer matches is refused; the next ensure rebuilds it.
+  local hl_now="" rev_now=""
+  hl_now=$(hyprland_commit)
+  rev_now=$(plugin_rev_for "$hl_now")
+  so_attested_for "$hl_now" "$rev_now" \
+    || fail "the built plugin no longer matches its build attestation; refusing to load it"
 
   local state=""
   state=$(plugin_state)
