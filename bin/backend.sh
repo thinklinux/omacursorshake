@@ -10,6 +10,14 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 STATEIO="$HERE/stateio.py"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 STATE_DIR="$STATE_HOME/omarchy/omacursorshake"
+# Collapse repeated separators before anything is derived from this string.
+# A trailing slash in XDG_STATE_HOME leaves a "//" that os.path.abspath and
+# the kernel both normalize away, so every file operation kept working and the
+# plugin looked healthy -- but so_is_mapped compares SO_PATH literally against
+# /proc/<pid>/maps, which is always canonical, so that one comparison could
+# never match and the mapped-.so ownership proof silently did nothing.
+# One pass only rewrites non-overlapping pairs, so "///" needs the loop.
+while [[ $STATE_DIR == *//* ]]; do STATE_DIR=${STATE_DIR//\/\//\/}; done
 SRC_DIR="$STATE_DIR/src"
 SO_PATH="$STATE_DIR/dynamic-cursors.so"
 STAMP_PATH="$STATE_DIR/built-for"
@@ -141,6 +149,12 @@ require_safe_state_path() {
   fi
   if [[ $p =~ [[:cntrl:]] ]]; then
     fail "state path must not contain control characters"
+  fi
+  # Enforces the invariant the normalization above establishes, so that if that
+  # step is ever removed the mapped-.so proof fails loudly here instead of
+  # silently never matching.
+  if [[ $p == *"//"* ]]; then
+    fail "state path must not contain repeated separators"
   fi
   if [[ $p == *"/../"* || $p == *"/.." ]]; then
     fail "state path must not contain .."
@@ -819,8 +833,15 @@ cmd_load() {
 
   # About to hand this file to the compositor to dlopen. Existence and
   # ownership say nothing about its content, so re-check the full attestation
-  # against the bytes on disk immediately before the load. Anything that no
-  # longer matches is refused; the next ensure rebuilds it.
+  # against the bytes on disk first. That catches a stale, corrupt, or
+  # half-written artifact, and one left behind by an older pipeline; the next
+  # ensure rebuilds it.
+  #
+  # It is not a race-proof gate, and should not be read as one. hyprctl takes a
+  # path, not a descriptor, so Hyprland reopens SO_PATH by name after this
+  # check and a same-uid process could swap the file in between. That is not a
+  # boundary this can defend -- such a process can already dlopen anything of
+  # its own -- and there is no descriptor-passing interface to close it with.
   local hl_now="" rev_now=""
   hl_now=$(hyprland_commit)
   rev_now=$(plugin_rev_for "$hl_now")

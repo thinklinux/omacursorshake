@@ -1188,6 +1188,45 @@ def test_source_tree_is_pinned_by_descriptor(tmp: Path) -> None:
     )
 
 
+def test_state_path_is_normalized(tmp: Path) -> None:
+    """A trailing slash in XDG_STATE_HOME must not survive into derived paths.
+
+    Every other consumer normalizes "//" away -- os.path.abspath collapses it,
+    the kernel collapses it -- so the plugin kept working and looked healthy.
+    But so_is_mapped compares SO_PATH literally against /proc/<pid>/maps, which
+    is always canonical, so that comparison could never match and the
+    mapped-.so ownership proof silently did nothing.
+    """
+    state = tmp / "state"
+    env = backend_env(tmp, state)
+    env["XDG_STATE_HOME"] = str(state) + "/"
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "status"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode == 0, f"status failed: {proc.stderr!r}")
+    status = json.loads(proc.stdout.decode())
+    for key in ("soPath", "settingsPath"):
+        value = status[key]
+        assert_true("//" not in value, f"{key} keeps a doubled separator: {value}")
+        assert_true(
+            value == os.path.abspath(value),
+            f"{key} is not the canonical path the kernel would report: {value}",
+        )
+
+    # The same must hold for a separator doubled in the middle, and for "///",
+    # which a single non-overlapping pass would leave as "//".
+    for suffix in ("//", "///"):
+        env["XDG_STATE_HOME"] = str(state) + suffix
+        proc = subprocess.run(
+            ["bash", str(BACKEND), "status"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+        )
+        assert_true(proc.returncode == 0, f"status failed for {suffix!r}: {proc.stderr!r}")
+        got = json.loads(proc.stdout.decode())["soPath"]
+        assert_true("//" not in got, f"{suffix!r} left a doubled separator: {got}")
+
+
 def test_watchdog_and_installer_guards() -> None:
     qml = (HERE.parent / "Service.qml").read_text()
     assert_true("jobWatchdog" in qml and "job.running = false" in qml, "no Process watchdog")
@@ -1236,6 +1275,7 @@ def main() -> int:
         test_substring_path_is_not_claimed_as_ours,
         test_settings_ranges_are_enforced,
         test_source_tree_is_pinned_by_descriptor,
+        test_state_path_is_normalized,
         test_watchdog_and_installer_guards,
     ]
     failed = 0
