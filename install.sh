@@ -29,4 +29,4 @@ sleep 0.4
 omarchy plugin enable "$ID" --section right
 
 echo "Enabled $ID from $SRC"
-echo "The first session builds hypr-dynamic-cursors in the background; shake the mouse once the bar icon undims."
+echo "The first session compiles the vendored cursor plugin in the background; shake the mouse once the bar icon undims."

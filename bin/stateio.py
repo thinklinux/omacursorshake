@@ -13,11 +13,12 @@ O_EXCL temporary in the already-opened directory, held open through
 write, fsync, and rename. Removal unlinks with dir_fd, is depth-bounded,
 and refuses mount or identity changes.
 
-The build path additionally pins the source tree by descriptor: backend.sh
-opens $SRC_DIR once and passes the inherited fd number, so the tree that is
-digested is byte-for-byte the tree that `make` compiles and the tree the
-built artifact is copied out of. Nothing in that sequence re-resolves the
-directory by name, so it cannot be swapped between verification and use.
+The build path additionally pins the vendored native tree by descriptor:
+backend.sh opens $NATIVE_DIR once and passes the inherited fd number, so the
+tree that is digested is byte-for-byte the tree that `make` compiles and the
+tree the built artifact is copied out of. Nothing in that sequence re-resolves
+the directory by name, so it cannot be swapped between verification and use.
+Build output in `out/` is skipped, like `.git`.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ MAX_COPY = 32 * 1024 * 1024
 MAX_REMOVE_DEPTH = 64
 MAX_DIGEST_BYTES = 256 * 1024 * 1024
 MAX_DIGEST_FILES = 50000
-DIGEST_SKIP = (".git",)
+DIGEST_SKIP = (".git", "out", "README.md", "LICENSE.md", "UPSTREAM")
 LOCK_PREFIX = ".lock."
 LOCK_WAIT_SECONDS = 10.0
 GROUP_OTHER_WRITE = stat.S_IWGRP | stat.S_IWOTH

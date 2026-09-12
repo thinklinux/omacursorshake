@@ -1,12 +1,15 @@
 #!/bin/bash
-# Build, load, and configure hypr-dynamic-cursors for Omarchy.
+# Build, load, and configure the vendored shake-only Hyprland plugin.
 # Never writes ~/.config/hypr/. Settings live in the state JSON; apply.lua
 # is eval'd at runtime and after every Hyprland config reload.
 
 set -euo pipefail
-export GIT_TERMINAL_PROMPT=0
 
-HERE=$(cd "$(dirname "$0")" && pwd)
+# Resolve through the plugin-dir symlink that `./install.sh` creates.
+# Logical `pwd` would keep ~/.config/omarchy/plugins/<id>, and tree-digest
+# then refuses that symlink component. Physical paths are the project tree.
+HERE=$(cd -P "$(dirname "$0")" && pwd -P)
+PLUGIN_ROOT=$(cd -P "$HERE/.." && pwd -P)
 STATEIO="$HERE/stateio.py"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 STATE_DIR="$STATE_HOME/omarchy/omacursorshake"
@@ -18,44 +21,22 @@ STATE_DIR="$STATE_HOME/omarchy/omacursorshake"
 # never match and the mapped-.so ownership proof silently did nothing.
 # One pass only rewrites non-overlapping pairs, so "///" needs the loop.
 while [[ $STATE_DIR == *//* ]]; do STATE_DIR=${STATE_DIR//\/\//\/}; done
-SRC_DIR="$STATE_DIR/src"
-SO_PATH="$STATE_DIR/dynamic-cursors.so"
+NATIVE_DIR="${OMACURSORSHAKE_NATIVE:-$PLUGIN_ROOT/native}"
+SO_PATH="$STATE_DIR/omacursorshake.so"
 STAMP_PATH="$STATE_DIR/built-for"
 SETTINGS_PATH="$STATE_DIR/settings.json"
 APPLY_LUA="$STATE_DIR/apply.lua"
 BUILD_LOG="$STATE_DIR/build.log"
 LOADED_IN_PATH="$STATE_DIR/loaded-in"
-REPO_URL="https://github.com/VirtCode/hypr-dynamic-cursors.git"
-# Config keys that make git execute a command on our behalf. The source tree
-# is re-cloned from scratch on every build so a planted .git cannot reach
-# these, but the same-uid actor who could plant one could equally edit
-# ~/.gitconfig, and clone applies init.templateDir from there. Global config
-# is otherwise left intact so proxy settings keep working.
-GIT_SAFE=(
-  -c core.hooksPath=/dev/null
-  -c init.templateDir=
-  -c core.fsmonitor=
-  -c core.pager=cat
-  -c core.editor=true
-  -c core.sshCommand=false
-  -c protocol.file.allow=never
-  -c protocol.ext.allow=never
-)
 # Generation of the build-and-attest pipeline. The stamp records it alongside
 # the digests, and cmd_ensure refuses to reuse an .so that was not produced by
 # the current generation. Bump this whenever a change to the build path makes
-# an older artifact no longer trustworthy: a plain-SHA stamp from <=1.0.14, or
-# any future weakening, then forces a rebuild instead of silently surviving an
-# upgrade. Without it the digest attestation would only ever cover fresh
-# installs.
-PIPELINE_VERSION=2
+# an older artifact no longer trustworthy.
+PIPELINE_VERSION=3
 DIAG_BYTES=2048
 LOG_BUDGET=65536
 IPC_TIMEOUT=5
 IPC_MAX_BYTES=65536
-CLONE_TIMEOUT=120
-FETCH_TIMEOUT=120
-CHECKOUT_TIMEOUT=30
 MAKE_TIMEOUT=300
 
 # Strip control characters and keep only the last DIAG_BYTES. tail -c must
@@ -271,96 +252,9 @@ require_range() {
     || fail "settings.$name must be between $lo and $hi (got $v)"
 }
 
-require_commit_sha() {
-  local sha=${1:-}
-  [[ $sha =~ ^[0-9a-f]{40}$ ]] || fail "hypr-dynamic-cursors pin must be a 40-character commit SHA (got: ${sha:-empty})"
-}
-
 require_sha256() {
   local d=${1:-}
   [[ $d =~ ^[0-9a-f]{64}$ ]] || fail "source digest must be 64 hex characters (got: ${d:-empty})"
-}
-
-# Hyprland commit -> hypr-dynamic-cursors commit (from upstream hyprpm.toml).
-# Unknown Hyprland versions fail; never fall back to a moving branch.
-plugin_rev_for() {
-  local hl="${1:-}"
-  case "$hl" in
-  918d8340afd652b011b937d29d5eea0be08467f5) echo "f0409be76564171a97a792deabab3bd0528fe40c" ;; # 0.41.2
-  9a09eac79b85c846e3a865a9078a3f8ff65a9259) echo "ddfea3a29c9badf6dabe12be86e4c5ba6d5507ad" ;; # 0.42.0
-  0f594732b063a90d44df8c5d402d658f27471dfe) echo "ddfea3a29c9badf6dabe12be86e4c5ba6d5507ad" ;; # 0.43.0
-  0c7a7e2d569eeed9d6025f3eef4ea0690d90845d) echo "3ff4c2a053f7673b3b8cd45ada0886cbda13ebcc" ;; # 0.44.0
-  4520b30d498daca8079365bdb909a8dea38e8d55) echo "3ff4c2a053f7673b3b8cd45ada0886cbda13ebcc" ;; # 0.44.1
-  a425fbebe4cf4238e48a42f724ef2208959d66cf) echo "81f4b964f997a3174596ef22c7a1dee8a5f616c7" ;; # 0.45.0
-  500d2a3580388afc8b620b0a3624147faa34f98b) echo "81f4b964f997a3174596ef22c7a1dee8a5f616c7" ;; # 0.45.1
-  12f9a0d0b93f691d4d9923716557154d74777b0a) echo "81f4b964f997a3174596ef22c7a1dee8a5f616c7" ;; # 0.45.2
-  788ae588979c2a1ff8a660f16e3c502ef5796755) echo "111669a699f998b5eb5a0d5610b5fcb748aab038" ;; # 0.46.0
-  254fc2bc6000075f660b4b8ed818a6af544d1d64) echo "111669a699f998b5eb5a0d5610b5fcb748aab038" ;; # 0.46.1
-  0bd541f2fd902dbfa04c3ea2ccf679395e316887) echo "111669a699f998b5eb5a0d5610b5fcb748aab038" ;; # 0.46.2
-  04ac46c54357278fc68f0a95d26347ea0db99496) echo "261bc1668f7de45b48ba6a40d5d727025575390b" ;; # 0.47.0
-  75dff7205f6d2bd437abfb4196f700abee92581a) echo "261bc1668f7de45b48ba6a40d5d727025575390b" ;; # 0.47.1
-  882f7ad7d2bbfc7440d0ccaef93b1cdd78e8e3ff) echo "261bc1668f7de45b48ba6a40d5d727025575390b" ;; # 0.47.2
-  5ee35f914f921e5696030698e74fb5566a804768) echo "9f40dc905e5b7e00f0c00956a5c2b007b26c50c2" ;; # 0.48.0
-  29e2e59fdbab8ed2cc23a20e3c6043d5decb5cdc) echo "2e7ea0224d8de63bb3ffead40e44248321b349bc" ;; # 0.48.1
-  9958d297641b5c84dcff93f9039d80a5ad37ab00) echo "0e0e58ca95a58ea44896558409e0a151e7013fc0" ;; # 0.49.0
-  c4a4c341568944bd4fb9cd503558b2de602c0213) echo "d6eb0b798c9b07f7f866647c8eb1d75a930501be" ;; # 0.50.0
-  4e242d086e20b32951fdc0ebcbfb4d41b5be8dcc) echo "d6eb0b798c9b07f7f866647c8eb1d75a930501be" ;; # 0.50.1
-  46174f78b374b6cea669c48880877a8bdcf7802f) echo "acac1f9a5c896ba934af1fc2414670c752ae529d" ;; # 0.51.0
-  71a1216abcc7031776630a6d88f105605c4dc1c9) echo "acac1f9a5c896ba934af1fc2414670c752ae529d" ;; # 0.51.1
-  f56ec180d3a03a5aa978391249ff8f40f949fb73) echo "8c1679b87c54e97145cae83e622956d720e88bef" ;; # 0.52.0
-  967c3c7404d4fa00234e29c70df3e263386d2597) echo "8c1679b87c54e97145cae83e622956d720e88bef" ;; # 0.52.1
-  386376400119dd46a767c9f8c8791fd22c7b6e61) echo "8c1679b87c54e97145cae83e622956d720e88bef" ;; # 0.52.2
-  ea444c35bb23b6e34505ab6753e069de7801cc25) echo "7e9b7bc9fbcbb2f7f8985ec1f435b43021609639" ;; # 0.53.0
-  ab1d80f3d6aebd57a0971b53a1993b1c1dfe0b09) echo "7e9b7bc9fbcbb2f7f8985ec1f435b43021609639" ;; # 0.53.1
-  39f3feddbee4a66be9608ed1eb7e73878d596b50) echo "7e9b7bc9fbcbb2f7f8985ec1f435b43021609639" ;; # 0.53.2
-  dd220efe7b1e292415bd0ea7161f63df9c95bfd3) echo "7e9b7bc9fbcbb2f7f8985ec1f435b43021609639" ;; # 0.53.3
-  0002f148c9a4fe421a9d33c0faa5528cdc411e62) echo "57e14edd0ae265b01828e466e287e96eb1e84dd3" ;; # 0.54.0
-  4b07770b9ef1cceb2e6f56d33538aaffb9186b9c) echo "57e14edd0ae265b01828e466e287e96eb1e84dd3" ;; # 0.54.1
-  59f9f2688ac508a0584d1462151195a6c4992f99) echo "57e14edd0ae265b01828e466e287e96eb1e84dd3" ;; # 0.54.2
-  521ece463c4a9d3d128670688a34756805a4328f) echo "57e14edd0ae265b01828e466e287e96eb1e84dd3" ;; # 0.54.3
-  af923e30d1d24f1f4a4f5cb8308065173c1d9539) echo "d195ab3ce94b0c983e04569a613361bff72be3d7" ;; # 0.55.0
-  a47147bc095e5b3be3eb8bd04f0ac242b968cd4d) echo "da447486c84e0be81f2cdd208af1ef92469f0a88" ;; # 0.55.1
-  39d7e209c79d451efab1b21151d5938289da838d) echo "da447486c84e0be81f2cdd208af1ef92469f0a88" ;; # 0.55.2
-  fe5fe79a29ac3adaf3e75560b2f4b7a6d58b31c9) echo "da447486c84e0be81f2cdd208af1ef92469f0a88" ;; # 0.55.3
-  a0136d8c04687bb36eb8a28eb9d1ff92aea99704) echo "da447486c84e0be81f2cdd208af1ef92469f0a88" ;; # 0.55.4
-  36b2e0cfe0c6094dbc47bd42a437431315bb3087) echo "f5ba36c7622098b53bf62ddb8ddf03b914abbdf8" ;; # 0.56.0
-  5c9377c15f85c50648f35ca5a213754f95b93ca0) echo "f5ba36c7622098b53bf62ddb8ddf03b914abbdf8" ;; # 0.56.1
-  efb50993780079460b0cbed1363e2166a2de1d9f) echo "5a224284872208b5324759d535d65061043725de" ;; # 0.56.2
-  *) echo "" ;;
-  esac
-}
-
-# hypr-dynamic-cursors commit -> SHA-256 of its source tree, as produced by
-# `stateio.py tree-digest` over the checkout with `.git` excluded.
-#
-# The commit SHA already binds the content, but only through git's SHA-1 and
-# only for as long as the object stays reachable on a branch: upstream
-# publishes no tags and no releases, so there is nothing immutable to point
-# at. This table is our own attestation of the bytes we reviewed, in a hash
-# git does not use, checked before anything is compiled. Regenerate and
-# re-verify it with `bin/verify_pins.py`.
-plugin_digest_for() {
-  case "${1:-}" in
-  f0409be76564171a97a792deabab3bd0528fe40c) echo "330ebd1b231fab0df2f9f50011f3e2b692d4acbc6f8c90f2ec1648f2efae3260" ;; # Hyprland 0.41.2
-  ddfea3a29c9badf6dabe12be86e4c5ba6d5507ad) echo "5c52af45427b153370880ff4c9adc226750cbe19b9a789bc869c49c01015c112" ;; # Hyprland 0.42.0-0.43.0
-  3ff4c2a053f7673b3b8cd45ada0886cbda13ebcc) echo "4da323a20fcbd6f28ac7f2cc6c532c29ba6abcc5a5cd88373aee5236c77013f1" ;; # Hyprland 0.44.0-0.44.1
-  81f4b964f997a3174596ef22c7a1dee8a5f616c7) echo "ba137f5e2fa49e2b044f25a8d8057882e10584b5bb32d2dca7a28d995fbf2918" ;; # Hyprland 0.45.0-0.45.2
-  111669a699f998b5eb5a0d5610b5fcb748aab038) echo "a6f96190bcc71d8115e96858a21922c0687ebad20e3d8e0902faedcc4351ec04" ;; # Hyprland 0.46.0-0.46.2
-  261bc1668f7de45b48ba6a40d5d727025575390b) echo "df4d1a2bcd21a016872670c3ab49776ce7b70644760ddc984ab82dc604428528" ;; # Hyprland 0.47.0-0.47.2
-  9f40dc905e5b7e00f0c00956a5c2b007b26c50c2) echo "d5da2b3e42dee07a8163f31e6fe71706aa86f3afb8e77b60a678ce2cbf39e327" ;; # Hyprland 0.48.0
-  2e7ea0224d8de63bb3ffead40e44248321b349bc) echo "51e61408f586279dd8ab483ed47101006607787ca5ee8324d90c2ee029e39c76" ;; # Hyprland 0.48.1
-  0e0e58ca95a58ea44896558409e0a151e7013fc0) echo "140aea67940b9a6f20d5496c475b726ca4a08df0a953ac7486c41892a7e13890" ;; # Hyprland 0.49.0
-  d6eb0b798c9b07f7f866647c8eb1d75a930501be) echo "8c2b3de1741afcd0f5402f64db41a2b8fece9d1541520ee85ed4c019d8052524" ;; # Hyprland 0.50.0-0.50.1
-  acac1f9a5c896ba934af1fc2414670c752ae529d) echo "8ed3888e1ad1224a0bebb795d2c8f53e15b97521abe10a063000ba6ed57cdff9" ;; # Hyprland 0.51.0-0.51.1
-  8c1679b87c54e97145cae83e622956d720e88bef) echo "ce6c1a4188425a7c7bf5a93fb38a8f83cfdc5acc770b9a8c4ea625853ca7b68f" ;; # Hyprland 0.52.0-0.52.2
-  7e9b7bc9fbcbb2f7f8985ec1f435b43021609639) echo "c44a99d644b0b8a4ea1a0e1e5eb30e589714582242df1420e2b88fdfeceba167" ;; # Hyprland 0.53.0-0.53.3
-  57e14edd0ae265b01828e466e287e96eb1e84dd3) echo "638b124ef12e2ac6b738edff96a3c248021ee20cd79f396ec2b6fe3cab9ca3d8" ;; # Hyprland 0.54.0-0.54.3
-  d195ab3ce94b0c983e04569a613361bff72be3d7) echo "8006d2c27233ed0f2f0155abaeda6cfcff824bc8ff2a0fcd5d20d44999d8ff88" ;; # Hyprland 0.55.0
-  da447486c84e0be81f2cdd208af1ef92469f0a88) echo "42c8c6164405ebd927b86d6b2acd951861a1020333a6aac7f2880382253722ae" ;; # Hyprland 0.55.1-0.55.4
-  f5ba36c7622098b53bf62ddb8ddf03b914abbdf8) echo "3ee62131ebe01492eb3c3d7c2b0ad7cc2ebed31e319df753154bc36ae2ba7e03" ;; # Hyprland 0.56.0-0.56.1
-  5a224284872208b5324759d535d65061043725de) echo "6af8c58d8c3a6887dab731a6bb28953679b55f43e500bb5827d6d5de68947b31" ;; # Hyprland 0.56.2
-  *) echo "" ;;
-  esac
 }
 
 # --- build attestation stamp -------------------------------------------------
@@ -388,13 +282,11 @@ write_stamp() {
   jq -n \
     --argjson pipeline "$PIPELINE_VERSION" \
     --arg hyprland "$1" \
-    --arg pluginRev "$2" \
-    --arg sourceDigest "$3" \
-    --arg soDigest "$4" \
+    --arg sourceDigest "$2" \
+    --arg soDigest "$3" \
     '{
       pipeline: $pipeline,
       hyprland: $hyprland,
-      pluginRev: $pluginRev,
       sourceDigest: $sourceDigest,
       soDigest: $soDigest
     }' | secure_write "$STAMP_PATH"
@@ -407,19 +299,16 @@ so_digest() {
 }
 
 # True only when the installed .so is the artifact this pipeline generation
-# built, from the source tree whose digest we attested, for this Hyprland and
-# this pinned upstream commit -- and the bytes on disk still hash to it.
-# A legacy plain-SHA stamp has no fields and fails here, forcing a rebuild.
+# built, from the native tree whose digest we attested, for this Hyprland --
+# and the bytes on disk still hash to it. A legacy stamp has no fields and
+# fails here, forcing a rebuild.
 so_attested_for() {
-  local hl=$1 rev=$2 raw="" want_src="" recorded=""
-  [[ -n $hl && -n $rev ]] || return 1
+  local hl=$1 want_src=$2 raw="" recorded=""
+  [[ -n $hl && -n $want_src ]] || return 1
   raw=$(read_stamp)
   [[ -n $raw ]] || return 1
   [[ $(stamp_field "$raw" pipeline) == "$PIPELINE_VERSION" ]] || return 1
   [[ $(stamp_field "$raw" hyprland) == "$hl" ]] || return 1
-  [[ $(stamp_field "$raw" pluginRev) == "$rev" ]] || return 1
-  want_src=$(plugin_digest_for "$rev")
-  [[ -n $want_src ]] || return 1
   [[ $(stamp_field "$raw" sourceDigest) == "$want_src" ]] || return 1
   recorded=$(stamp_field "$raw" soDigest)
   [[ $recorded =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -492,7 +381,7 @@ plugin_state() {
     # ours would push our config into a binary we never verified. This matches
     # the exact-pathname rule stateio.py maps-has applies to /proc/<pid>/maps.
     if any(entries; pathof == $so) then "mine"
-    elif any(entries; nameof | test("dynamic-cursors"; "i")) then "unknown"
+    elif any(entries; nameof | test("omacursorshake"; "i")) then "unknown"
     else "none"
     end
   ' 2>/dev/null || true)
@@ -576,63 +465,31 @@ write_apply_lua() {
   require_range base "$base" 3 6
   (( timeout >= 1000 && timeout <= 3000 )) || fail "settings.timeout must be 1000-3000 ms"
 
-  # Default simulation mode is tilt. hl.config() updates the Hyprlang store
-  # but CVariantProp keeps the live MODE until activate() (setShape or a
-  # config reload). Shape rules force mode=none (and zero tilt) on every
-  # protocol/xcursor name Hyprland actually uses, including wallpaper
-  # left_ptr. eval_apply then reloads the cursor so activate() runs now.
   local lua
   lua=$(cat <<EOF
-if hl.plugin.dynamic_cursors then
+if hl.plugin.omacursorshake then
   hl.config({
     plugin = {
-      dynamic_cursors = {
+      omacursorshake = {
         enabled = ${enabled},
-        mode = "none",
-        tilt = { full = 0 },
-        rotate = { length = 0 },
         shake = {
           enabled = ${enabled},
           threshold = ${threshold},
           base = ${base},
           timeout = ${timeout},
-          effects = false,
+        },
+        hyprcursor = {
+          enabled = true,
         },
       },
     },
   })
-  local shapes = {
-    "clientside", "left_ptr", "default", "context_menu", "help", "pointer",
-    "progress", "wait", "cell", "crosshair", "text", "vertical_text", "alias",
-    "copy", "move", "no_drop", "not_allowed", "grab", "grabbing",
-    "e-resize", "n-resize", "ne-resize", "nw-resize", "s-resize", "se-resize",
-    "sw-resize", "w-resize", "ew-resize", "ns-resize", "nesw-resize",
-    "nwse-resize", "col-resize", "row-resize", "all-scroll", "zoom-in", "zoom-out",
-    "X_cursor", "xterm", "hand1", "hand2", "watch", "fleur", "pirate",
-    "sb_h_double_arrow", "sb_v_double_arrow", "sb_left_arrow", "sb_right_arrow",
-    "sb_up_arrow", "sb_down_arrow", "top_left_corner", "top_right_corner",
-    "bottom_left_corner", "bottom_right_corner", "left_side", "right_side",
-    "top_side", "bottom_side", "sizing", "circle", "plus", "pencil",
-    "cross", "crossed_circle", "dnd-move", "dnd-copy", "dnd-link", "dnd-none",
-    "dnd-no-drop", "center_ptr", "arrow", "right_ptr",
-  }
-  for _, s in ipairs(shapes) do
-    hl.plugin.dynamic_cursors.shape_rule {
-      shape = s,
-      mode = "none",
-      tilt = { full = 0 },
-      rotate = { length = 0 },
-    }
-  end
 end
 EOF
 )
   printf '%s\n' "$lua" | secure_write "$APPLY_LUA"
 }
 
-# Reload the cursor manager so dynamic-cursors activate() runs against the
-# rules we just published. Without this, mode stays at the default "tilt"
-# until the pointer happens to change shape.
 force_cursor_activate() {
   local theme size
   theme=${HYPRCURSOR_THEME:-${XCURSOR_THEME:-}}
@@ -659,12 +516,10 @@ eval_apply() {
 
 cmd_status() {
   ensure_state_dir
-  local arch hl_commit hl_ver built loaded so_exists needs
+  local arch hl_commit hl_ver built loaded so_exists needs src_digest=""
   arch=$(capture_bounded 64 5 uname -m)
   hl_commit=$(hyprland_commit)
   hl_ver=$(hyprland_version)
-  local plugin_rev=""
-  plugin_rev=$(plugin_rev_for "$hl_commit")
   # builtFor reports the Hyprland the current attestation names. A legacy
   # plain-SHA stamp has no such field and reads empty, which is accurate:
   # nothing about that artifact is attested any more.
@@ -676,12 +531,14 @@ cmd_status() {
   # Only a proven-ours plugin counts as loaded. "unknown" is reported as false
   # rather than dressed up as success.
   plugin_is_mine && loaded=true
+  src_digest=$(native_digest 2>/dev/null || true)
+  src_digest=$(sanitize_field "${src_digest//$'\n'/}" 64)
   # Same rule the build path uses, so the UI never shows an up-to-date plugin
   # that cmd_ensure would in fact rebuild.
   needs=false
   if [[ $arch != x86_64 ]]; then
     needs=false
-  elif [[ $so_exists != true ]] || ! so_attested_for "$hl_commit" "$plugin_rev"; then
+  elif [[ $so_exists != true ]] || ! so_attested_for "$hl_commit" "$src_digest"; then
     needs=true
   fi
   jq -n \
@@ -692,7 +549,7 @@ cmd_status() {
     --arg builtFor "$built" \
     --arg hyprlandCommit "$hl_commit" \
     --arg hyprlandVersion "$hl_ver" \
-    --arg pluginRev "$plugin_rev" \
+    --arg sourceDigest "$src_digest" \
     --argjson needsRebuild "$needs" \
     --argjson loaded "$loaded" \
     --arg settingsPath "$SETTINGS_PATH" \
@@ -704,7 +561,7 @@ cmd_status() {
       builtFor: $builtFor,
       hyprlandCommit: $hyprlandCommit,
       hyprlandVersion: $hyprlandVersion,
-      pluginRev: $pluginRev,
+      sourceDigest: $sourceDigest,
       needsRebuild: $needsRebuild,
       loaded: $loaded,
       settingsPath: $settingsPath
@@ -713,117 +570,73 @@ cmd_status() {
 
 ensure_tree() {
   ensure_state_dir
-  [[ $(capture_bounded 64 5 uname -m) == x86_64 ]] || fail "hypr-dynamic-cursors only works on x86_64 (Hyprland function hooks)"
-  command -v git >/dev/null || fail "git is required to fetch hypr-dynamic-cursors"
-  command -v make >/dev/null || fail "make is required to build hypr-dynamic-cursors"
-  command -v g++ >/dev/null || fail "g++ is required to build hypr-dynamic-cursors"
-  command -v timeout >/dev/null || fail "timeout (coreutils) is required to bound git/make"
+  [[ $(capture_bounded 64 5 uname -m) == x86_64 ]] || fail "omacursorshake only works on x86_64 (Hyprland function hooks)"
+  command -v make >/dev/null || fail "make is required to build omacursorshake"
+  command -v g++ >/dev/null || fail "g++ is required to build omacursorshake"
+  command -v timeout >/dev/null || fail "timeout (coreutils) is required to bound make"
   command -v python3 >/dev/null || fail "python3 is required to cap build-log size"
-  # The build runs the compiler through a pinned directory descriptor, which
-  # needs env --chdir (coreutils 8.28+). Fail here with a clear cause rather
-  # than mid-build, and never silently fall back to resolving $SRC_DIR by name.
   env --chdir=/ true >/dev/null 2>&1 \
     || fail "env --chdir (coreutils 8.28+) is required to pin the source tree during the build"
   [[ -r /proc/self/fd ]] || fail "/proc must be mounted to pin the source tree during the build"
   pkg-config --exists hyprland || fail "pkg-config hyprland is missing; install the hyprland package"
+  [[ -d $NATIVE_DIR ]] || fail "vendored plugin source is missing: $NATIVE_DIR"
+  [[ -f $NATIVE_DIR/Makefile ]] || fail "vendored plugin Makefile is missing: $NATIVE_DIR/Makefile"
 }
 
-# The tree we are about to compile must be exactly the pinned commit, with
-# nothing extra in it for make to pick up.
-#
-# Everything here addresses the pinned descriptor ($2 is the fd, $3 the
-# /proc/self/fd path that resolves through it), never $SRC_DIR by name, so the
-# tree that is verified is provably the same inode the compiler then reads.
-# Echoes the verified source digest on stdout for the stamp.
-verify_source_tree() {
-  local want=$1 srcfd=$2 pin=$3 head="" dirty="" want_digest="" got_digest=""
-  head=$(capture_bounded 128 "$CHECKOUT_TIMEOUT" \
-    git "${GIT_SAFE[@]}" -C "$pin" rev-parse HEAD)
-  head=$(sanitize_field "$head" 64)
-  [[ $head == "$want" ]] || fail "checkout is '${head:-empty}', expected the pinned $want"
-  dirty=$(capture_bounded 4096 "$CHECKOUT_TIMEOUT" \
-    git "${GIT_SAFE[@]}" -C "$pin" status --porcelain --untracked-files=all)
-  [[ -z $dirty ]] || fail "source tree is not clean after checkout; refusing to build"
+native_digest() {
+  python3 "$STATEIO" tree-digest "$NATIVE_DIR"
+}
 
-  # Everything above this line is git telling us about itself. The digest is
-  # the one check that reads the bytes make is about to compile, so it is what
-  # actually says the tree is the source we reviewed.
-  want_digest=$(plugin_digest_for "$want")
-  [[ -n $want_digest ]] || fail "no recorded source digest for hypr-dynamic-cursors $want"
-  require_sha256 "$want_digest"
+# Digest the pinned native descriptor. The inode that is hashed is the inode
+# make then compiles and the artifact is copied out of.
+verify_source_tree() {
+  local srcfd=$1 got_digest=""
   got_digest=$(python3 "$STATEIO" tree-digest-fd "$srcfd") \
-    || fail "could not digest the source tree at $SRC_DIR"
+    || fail "could not digest the source tree at $NATIVE_DIR"
   got_digest=$(sanitize_field "${got_digest//$'\n'/}" 64)
-  [[ $got_digest == "$want_digest" ]] \
-    || fail "source tree digest is $got_digest, expected $want_digest for $want; refusing to build"
+  require_sha256 "$got_digest"
   printf '%s\n' "$got_digest"
 }
 
 cmd_ensure() {
   local force=${1:-0}
   ensure_tree
-  local hl_commit plugin_rev was_loaded=false
+  require_safe_state_path "$NATIVE_DIR"
+  local hl_commit was_loaded=false src_digest=""
   hl_commit=$(hyprland_commit)
   [[ -n $hl_commit ]] || fail "could not read Hyprland version (is hyprctl available?)"
-  plugin_rev=$(plugin_rev_for "$hl_commit")
-  [[ -n $plugin_rev ]] || fail "no pinned hypr-dynamic-cursors commit for Hyprland $hl_commit ($(hyprland_version))"
-  require_commit_sha "$plugin_rev"
-  # Conservative on purpose: any matching plugin may have our .so mapped.
+  src_digest=$(native_digest)
+  src_digest=$(sanitize_field "${src_digest//$'\n'/}" 64)
+  require_sha256 "$src_digest"
   plugin_present && was_loaded=true
 
-  # Reuse the installed .so only when its full attestation still holds. An
-  # artifact whose stamp predates this pipeline generation, names a different
-  # upstream commit, records a source digest we no longer vouch for, or whose
-  # bytes have changed since install, is rebuilt rather than trusted.
   if (( force == 0 )) && python3 "$STATEIO" exists "$SO_PATH" \
-     && so_attested_for "$hl_commit" "$plugin_rev"; then
+     && so_attested_for "$hl_commit" "$src_digest"; then
     cmd_status
     return 0
   fi
 
-  emit_diag "omacursorshake: building hypr-dynamic-cursors $plugin_rev for Hyprland $hl_commit"
+  emit_diag "omacursorshake: building vendored plugin for Hyprland $hl_commit"
 
-  # Always rebuild the tree from scratch. Reusing whatever sits in $SRC_DIR
-  # let a same-uid process pre-plant git hooks, executable git config, or an
-  # untracked GNUmakefile -- which GNU make prefers over Makefile and which
-  # survives checkout -- and so reach `make` and then the compositor dlopen.
-  python3 "$STATEIO" rm-tree "$STATE_DIR" src
-  run_timed "$CLONE_TIMEOUT" git "${GIT_SAFE[@]}" clone \
-    --filter=blob:none --no-checkout "$REPO_URL" "$SRC_DIR"
-  python3 "$STATEIO" ensure-dir "$SRC_DIR"
-
-  run_timed "$FETCH_TIMEOUT" git "${GIT_SAFE[@]}" -C "$SRC_DIR" fetch --force origin "$plugin_rev"
-  run_timed "$CHECKOUT_TIMEOUT" git "${GIT_SAFE[@]}" -C "$SRC_DIR" checkout --detach "$plugin_rev"
-
-  # Pin the source tree by descriptor for the rest of the build. Until now
-  # every git step addressed $SRC_DIR by name; from here nothing does. Children
-  # inherit the fd, so /proc/self/fd/$srcfd resolves through our own open
-  # descriptor inside git, python3, and make alike, and the inode that is
-  # digested is provably the inode the compiler reads and the artifact is
-  # copied out of. Re-resolving the name at any of those steps would leave a
-  # window for a same-uid process to swap the directory after verification.
-  local srcfd="" src_pin="" src_digest=""
-  exec {srcfd}<"$SRC_DIR" || fail "could not pin the source tree at $SRC_DIR"
+  local srcfd="" src_pin="" verified=""
+  exec {srcfd}<"$NATIVE_DIR" || fail "could not pin the source tree at $NATIVE_DIR"
   src_pin="/proc/self/fd/$srcfd"
-  src_digest=$(verify_source_tree "$plugin_rev" "$srcfd" "$src_pin")
-  require_sha256 "$src_digest"
-  # -f Makefile: never let a GNUmakefile take precedence. --chdir rather than
-  # make -C so the Makefile sees a real getcwd() and not the /proc alias.
+  verified=$(verify_source_tree "$srcfd")
+  require_sha256 "$verified"
+  [[ $verified == "$src_digest" ]] \
+    || fail "source tree changed between digest and pin; refusing to build"
   run_timed "$MAKE_TIMEOUT" env --chdir="$src_pin" make -f Makefile all
 
   if [[ $was_loaded == true ]]; then
     emit_diag "omacursorshake: plugin is loaded; installing beside the mapped inode"
   fi
-  # The digest comes back from the process that published the bytes, not from
-  # a second read of the destination: re-reading SO_PATH here would leave a
-  # window in which the stamp could end up attesting someone else's file.
   local so_sha=""
-  so_sha=$(install_so_from "$srcfd" out/dynamic-cursors.so)
+  so_sha=$(install_so_from "$srcfd" out/omacursorshake.so)
   so_sha=$(sanitize_field "${so_sha//$'\n'/}" 64)
   require_sha256 "$so_sha"
   exec {srcfd}<&-
 
-  write_stamp "$hl_commit" "$plugin_rev" "$src_digest" "$so_sha"
+  write_stamp "$hl_commit" "$verified" "$so_sha"
   cmd_status
 }
 
@@ -842,10 +655,11 @@ cmd_load() {
   # check and a same-uid process could swap the file in between. That is not a
   # boundary this can defend -- such a process can already dlopen anything of
   # its own -- and there is no descriptor-passing interface to close it with.
-  local hl_now="" rev_now=""
+  local hl_now="" src_now=""
   hl_now=$(hyprland_commit)
-  rev_now=$(plugin_rev_for "$hl_now")
-  so_attested_for "$hl_now" "$rev_now" \
+  src_now=$(native_digest 2>/dev/null || true)
+  src_now=$(sanitize_field "${src_now//$'\n'/}" 64)
+  so_attested_for "$hl_now" "$src_now" \
     || fail "the built plugin no longer matches its build attestation; refusing to load it"
 
   local state=""
@@ -855,7 +669,7 @@ cmd_load() {
     # Refuse rather than guess. Loading a second copy would be rejected by the
     # compositor, and pushing our config into someone else's plugin would make
     # us a confused deputy for a build we never verified.
-    fail "a dynamic-cursors plugin is already loaded that we cannot prove is ours; remove the other copy (hyprpm remove hypr-dynamic-cursors) and retry"
+    fail "an omacursorshake plugin is already loaded that we cannot prove is ours; unload the other copy and retry"
   fi
 
   if [[ $state == none ]]; then
@@ -926,6 +740,9 @@ usage() {
 
 require_base_tools
 require_safe_state_path "$STATE_DIR"
+NATIVE_DIR=$(cd -P "$NATIVE_DIR" && pwd -P) \
+  || fail "cannot resolve native source dir: $NATIVE_DIR"
+require_safe_state_path "$NATIVE_DIR"
 
 cmd=${1:-}
 case "$cmd" in

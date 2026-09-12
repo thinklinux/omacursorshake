@@ -8,7 +8,6 @@ import json
 import mmap
 import os
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -79,7 +78,7 @@ def test_intermediate_symlink_refused(tmp: Path) -> None:
     src = tmp / "real" / "built.so"
     src.parent.mkdir()
     src.write_bytes(b"plugin")
-    proc = run(["copy", str(src), str(base / "omarchy" / "omacursorshake" / "dynamic-cursors.so")], check=False)
+    proc = run(["copy", str(src), str(base / "omarchy" / "omacursorshake" / "omacursorshake.so")], check=False)
     assert_true(proc.returncode != 0, "copy dest followed intermediate symlink")
 
 
@@ -368,6 +367,9 @@ def test_settings_has_one_writer(tmp: Path) -> None:
     assert_true('backend, "save"' not in qml, "save job still raced beside apply/disable")
 
 
+PLUGIN_SO = "omacursorshake.so"
+PLUGIN_NAME = "omacursorshake"
+
 STUB_TOOLS = {
     "uname": "#!/bin/sh\nprintf 'x86_64\\n'\n",
     "pkg-config": "#!/bin/sh\nexit 0\n",
@@ -381,33 +383,17 @@ STUB_TOOLS = {
         "  *) printf 'ok\\n' ;;\n"
         "esac\n"
     ),
-    "git": (
-        "#!/bin/sh\n"
-        "echo \"git $*\" >&2\n"
-        "while [ \"$1\" = \"-c\" ]; do shift 2; done\n"
-        "dir=\"\"\n"
-        "if [ \"$1\" = \"-C\" ]; then dir=$2; shift 2; fi\n"
-        "case \"$1\" in\n"
-        "  clone) shift; for a in \"$@\"; do last=$a; done; mkdir -p \"$last/.git\" ;;\n"
-        "  checkout) [ -n \"${STUB_SRC:-}\" ] && printf '%s' \"$STUB_SRC\" > \"$dir/source.cpp\" ;;\n"
-        "  rev-parse) printf '%s\\n' \"${STUB_HEAD:-5a224284872208b5324759d535d65061043725de}\" ;;\n"
-        "  status) printf '%s' \"${STUB_DIRTY:-}\" ;;\n"
-        "esac\n"
-        "exit 0\n"
-    ),
     "make": (
         "#!/bin/sh\n"
         "echo \"make $*\" >&2\n"
         "[ -n \"${STUB_ARGV_LOG:-}\" ] && echo \"make $* cwd=$(pwd -P)\" >> \"$STUB_ARGV_LOG\"\n"
-        # The build runs us via `env --chdir=/proc/self/fd/N`, so with no -C the
-        # artifact belongs in the current directory -- which is the pinned tree.
         "dir=.\n"
         "while [ $# -gt 0 ]; do\n"
         "  case \"$1\" in -C) dir=$2; shift 2 ;; *) shift ;; esac\n"
         "done\n"
         "${NOISE_CMD:-true}\n"
         "mkdir -p \"$dir/out\"\n"
-        "printf 'ELF-STUB\\n' > \"$dir/out/dynamic-cursors.so\"\n"
+        "printf 'ELF-STUB\\n' > \"$dir/out/omacursorshake.so\"\n"
         "exit 0\n"
     ),
 }
@@ -423,7 +409,6 @@ def stub_path(tmp: Path) -> str:
     return f"{stubs}:{os.environ.get('PATH', '')}"
 
 
-PIN_0562 = "5a224284872208b5324759d535d65061043725de"
 HL_0562 = "efb50993780079460b0cbed1363e2166a2de1d9f"
 
 
@@ -439,33 +424,30 @@ def pipeline_version() -> int | None:
     return int(m.group(1)) if m else None
 
 
-def recorded_source_digest(rev: str) -> str:
-    m = re.search(rf'{rev}\) echo "([0-9a-f]{{64}})"', backend_section("plugin_digest_for"))
-    assert_true(m is not None, f"no recorded source digest for {rev}")
-    return m.group(1)
+def stub_native(tmp: Path, body: bytes = b"int main(){}\n") -> Path:
+    native = tmp / "native"
+    (native / "src").mkdir(parents=True, exist_ok=True)
+    (native / "Makefile").write_text("all:\n\t@true\n")
+    (native / "src" / "main.cpp").write_bytes(body)
+    return native
 
 
-def seed_attested_so(state: Path, content: bytes = b"ELF-STUB\n", **override) -> Path:
-    """Install an .so plus the stamp attesting it, exactly as a build would.
+def tree_digest(path: Path) -> str:
+    return run(["tree-digest", str(path)]).stdout.decode().strip()
 
-    Tests that only care about load behaviour need a *valid* attestation to get
-    past the gate; the gate itself is exercised by the tests that corrupt one.
-    """
+
+def seed_attested_so(state: Path, content: bytes = b"ELF-STUB\n", source_digest: str | None = None, **override) -> Path:
+    """Install an .so plus the stamp attesting it, exactly as a build would."""
     state.mkdir(parents=True, exist_ok=True)
-    so = state / "dynamic-cursors.so"
+    so = state / PLUGIN_SO
     so.write_bytes(content)
     pv = pipeline_version()
     if pv is None:
-        # Backend predates the attestation, where existence was the whole gate.
-        # Returning a bare .so keeps these fixtures usable against the old code,
-        # so a regression test fails on the behaviour it is about rather than on
-        # its own setup.
         return so
     stamp = {
         "pipeline": pv,
         "hyprland": HL_0562,
-        "pluginRev": PIN_0562,
-        "sourceDigest": recorded_source_digest(PIN_0562),
+        "sourceDigest": source_digest or ("a" * 64),
         "soDigest": hashlib.sha256(content).hexdigest(),
     }
     stamp.update(override)
@@ -473,66 +455,35 @@ def seed_attested_so(state: Path, content: bytes = b"ELF-STUB\n", **override) ->
     return so
 
 
-def tree_digest(path: Path) -> str:
-    return run(["tree-digest", str(path)]).stdout.decode().strip()
-
-
-def patched_backend(tmp: Path, expected_digest: str) -> Path:
-    """A copy of backend.sh whose 0.56.2 source digest is the stub tree's.
-
-    The stub build pipeline cannot produce upstream's real source, so the
-    recorded digest is swapped for the stub tree's. Only that one hex string
-    changes: the gate itself is the shipped code, running for real.
-    """
-    bindir = tmp / "patched-bin"
-    bindir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(STATEIO, bindir / "stateio.py")
-    text = BACKEND.read_text()
-    head = text.index("plugin_digest_for()")
-    marker = f'  {PIN_0562}) echo "'
-    i = text.index(marker, head) + len(marker)
-    j = text.index('"', i)
-    dest = bindir / "backend.sh"
-    dest.write_text(text[:i] + expected_digest + text[j:])
-    dest.chmod(0o755)
-    return dest
-
-
-def empty_tree_digest(tmp: Path) -> str:
-    """Digest of a tree holding nothing but .git -- what the git stub leaves."""
-    d = tmp / "empty-tree"
-    (d / ".git").mkdir(parents=True, exist_ok=True)
-    return tree_digest(d)
-
-
-def backend_env(tmp: Path, state: Path) -> dict[str, str]:
+def backend_env(tmp: Path, state: Path, native: Path | None = None) -> dict[str, str]:
     env = dict(os.environ)
     env["PATH"] = stub_path(tmp)
     env["XDG_STATE_HOME"] = str(state)
+    env["OMACURSORSHAKE_NATIVE"] = str(native or stub_native(tmp))
     return env
 
 
 def test_backend_build_pipeline(tmp: Path) -> None:
     """run_timed must read both pipeline stages; a stale PIPESTATUS broke every build."""
     state = tmp / "state"
-    env = backend_env(tmp, state)
-    backend = patched_backend(tmp, empty_tree_digest(tmp))
+    native = stub_native(tmp)
+    env = backend_env(tmp, state, native)
     proc = subprocess.run(
-        ["bash", str(backend), "ensure"],
+        ["bash", str(BACKEND), "ensure"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
     assert_true(b"PIPESTATUS" not in proc.stderr, f"PIPESTATUS leak: {proc.stderr!r}")
     sdir = state / "omarchy" / "omacursorshake"
-    so = sdir / "dynamic-cursors.so"
+    so = sdir / PLUGIN_SO
     assert_true(so.is_file(), "no .so installed")
     assert_true(so.stat().st_mode & 0o777 == 0o755, f"so mode {so.stat().st_mode:o}")
     stamp = json.loads((sdir / "built-for").read_text())
     assert_true(stamp["hyprland"] == HL_0562, f"stamp names the wrong Hyprland: {stamp}")
-    assert_true(stamp["pluginRev"] == PIN_0562, f"stamp names the wrong pin: {stamp}")
+    assert_true("pluginRev" not in stamp, f"stamp still names an upstream pin: {stamp}")
     assert_true(stamp["pipeline"] == pipeline_version(), f"stamp pipeline: {stamp}")
     assert_true(
-        stamp["sourceDigest"] == empty_tree_digest(tmp),
+        stamp["sourceDigest"] == tree_digest(native),
         "stamp does not record the source digest that was verified",
     )
     assert_true(
@@ -544,15 +495,23 @@ def test_backend_build_pipeline(tmp: Path) -> None:
     log = sdir / "build.log"
     assert_true(log.is_file() and log.stat().st_size <= 65536, "build log unbounded")
 
+    argv_log = tmp / "make-reuse.log"
+    env["STUB_ARGV_LOG"] = str(argv_log)
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "ensure"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    assert_true(proc.returncode == 0, f"reuse ensure failed: {proc.stderr!r}")
+    assert_true(not argv_log.exists(), "unchanged native tree was rebuilt")
+
 
 def test_backend_build_log_budget(tmp: Path) -> None:
     """A noisy phase must fail closed and keep build.log inside the budget."""
     state = tmp / "state"
     env = backend_env(tmp, state)
     env["NOISE_CMD"] = "head -c 400000 /dev/zero | tr '\\0' 'n'"
-    backend = patched_backend(tmp, empty_tree_digest(tmp))
     proc = subprocess.run(
-        ["bash", str(backend), "ensure"],
+        ["bash", str(BACKEND), "ensure"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     assert_true(proc.returncode != 0, "noisy build accepted")
@@ -571,6 +530,7 @@ def _hyprctl_stub(tmp: Path, body: str) -> dict[str, str]:
     stub.write_text(body)
     stub.chmod(0o755)
     env["XDG_STATE_HOME"] = str(tmp / "state")
+    env["OMACURSORSHAKE_NATIVE"] = str(stub_native(tmp))
     return env
 
 
@@ -614,7 +574,7 @@ def test_hyprctl_output_is_byte_bounded(tmp: Path) -> None:
         "case \"$*\" in\n"
         "  *version*) printf '{\"commit\":\"%s\",\"version\":\"0.56.2\"}\\n' "
         "efb50993780079460b0cbed1363e2166a2de1d9f ;;\n"
-        "  *) yes '{\"name\":\"flood-dynamic-cursors\"}' ;;\n"
+        "  *) yes '{\"name\":\"flood-omacursorshake\"}' ;;\n"
         "esac\n"
     )
     env = _hyprctl_stub(tmp / "flood", body)
@@ -658,59 +618,64 @@ def test_gnumakefile_precedence_is_defeated(tmp: Path) -> None:
     assert_true("make -f Makefile all" in BACKEND.read_text(), "backend does not pin -f Makefile")
 
 
-def test_planted_source_tree_is_destroyed(tmp: Path) -> None:
-    """A pre-planted src tree must never survive into checkout or make."""
-    state = tmp / "state"
-    sdir = state / "omarchy" / "omacursorshake"
-    src = sdir / "src"
-    (src / ".git" / "hooks").mkdir(parents=True)
-    marker = tmp / "HOOK-RAN"
-    hook = src / ".git" / "hooks" / "post-checkout"
-    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
-    hook.chmod(0o755)
-    (src / ".git" / "config").write_text("[core]\n\tfsmonitor = touch %s\n" % (tmp / "FSMON-RAN"))
-    (src / "GNUmakefile").write_text("all:\n\t@touch %s\n" % (tmp / "GNUMAKE-RAN"))
-    planted = src / "planted-marker"
-    planted.write_text("x")
-
-    env = backend_env(tmp, state)
+def test_ensure_does_not_invoke_git(tmp: Path) -> None:
+    """The vendored tree is compiled in place; git must not run at all."""
+    env = backend_env(tmp, tmp / "state")
+    git = tmp / "stubs" / "git"
+    git.write_text("#!/bin/sh\necho GIT-RAN >&2; exit 1\n")
+    git.chmod(0o755)
     argv_log = tmp / "make-argv.log"
     env["STUB_ARGV_LOG"] = str(argv_log)
-    backend = patched_backend(tmp, empty_tree_digest(tmp))
     proc = subprocess.run(
-        ["bash", str(backend), "ensure"],
+        ["bash", str(BACKEND), "ensure"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
     )
     assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
-    for m in ("HOOK-RAN", "FSMON-RAN", "GNUMAKE-RAN"):
-        assert_true(not (tmp / m).exists(), f"{m}: planted code executed")
-    assert_true(not planted.exists(), "planted file survived into the build tree")
+    assert_true(b"GIT-RAN" not in proc.stderr, f"git ran: {proc.stderr!r}")
+    assert_true("clone" not in BACKEND.read_text(), "backend still clones")
+    assert_true("github.com/VirtCode" not in BACKEND.read_text(), "backend still fetches upstream")
     assert_true("-f Makefile" in argv_log.read_text(), "make was not pinned to Makefile")
 
-    src_txt = BACKEND.read_text()
-    assert_true("need_clone" not in src_txt, "source-tree reuse branch is back")
-    assert_true("core.hooksPath=/dev/null" in src_txt, "git hook neutralisation missing")
 
-
-def test_checkout_must_match_the_pin(tmp: Path) -> None:
-    """A tree that is not the pinned commit, or is dirty, must not be built."""
-    env = backend_env(tmp / "wrong", tmp / "wrong" / "state")
-    env["STUB_HEAD"] = "0" * 40
+def test_native_dir_symlink_is_resolved(tmp: Path) -> None:
+    """A native tree reached through a symlink must digest the real directory."""
+    native = stub_native(tmp)
+    link = tmp / "native-link"
+    link.symlink_to(native)
+    env = backend_env(tmp, tmp / "state", link)
     proc = subprocess.run(
         ["bash", str(BACKEND), "ensure"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
     )
-    assert_true(proc.returncode != 0, "built from the wrong commit")
-    assert_true(b"expected the pinned" in proc.stderr, f"err: {proc.stderr!r}")
+    assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
+    assert_true(b"refusing symlink" not in proc.stderr, proc.stderr.decode())
+    status = json.loads(proc.stdout.decode())
+    assert_true(
+        status["sourceDigest"] == tree_digest(native),
+        f"did not digest the real tree: {status}",
+    )
+    assert_true(status["needsRebuild"] is False, status)
 
-    env = backend_env(tmp / "dirty", tmp / "dirty" / "state")
-    env["STUB_DIRTY"] = "?? injected.cpp\n"
+
+def test_plugin_install_symlink_status(tmp: Path) -> None:
+    """./install.sh symlinks plugins/<id> to the checkout; QML runs backend there."""
+    plug = tmp / "plugins" / "io.github.thinklinux.omacursorshake"
+    plug.parent.mkdir(parents=True)
+    plug.symlink_to(HERE.parent)
+    env = dict(os.environ)
+    env["PATH"] = stub_path(tmp)
+    env["XDG_STATE_HOME"] = str(tmp / "state")
     proc = subprocess.run(
-        ["bash", str(BACKEND), "ensure"],
+        ["bash", str(plug / "bin" / "backend.sh"), "status"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
     )
-    assert_true(proc.returncode != 0, "built from a dirty tree")
-    assert_true(b"not clean" in proc.stderr, f"err: {proc.stderr!r}")
+    assert_true(proc.returncode == 0, f"status failed: {proc.stderr!r}")
+    assert_true(b"refusing symlink" not in proc.stderr, proc.stderr.decode())
+    status = json.loads(proc.stdout.decode())
+    assert_true(
+        len(status.get("sourceDigest") or "") == 64,
+        f"no source digest through the plugin symlink: {status}",
+    )
 
 
 def _load_stub(tmp: Path, listed_after: str, load_exit: int) -> dict[str, str]:
@@ -733,7 +698,11 @@ def _load_stub(tmp: Path, listed_after: str, load_exit: int) -> dict[str, str]:
     env = _hyprctl_stub(tmp, body)
     env["STUB_LOADED"] = str(tmp / "loaded-flag")
     env["STUB_LISTED_AFTER"] = listed_after
-    seed_attested_so(Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake")
+    native = Path(env["OMACURSORSHAKE_NATIVE"])
+    seed_attested_so(
+        Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake",
+        source_digest=tree_digest(native),
+    )
     return env
 
 
@@ -750,7 +719,7 @@ def test_load_requires_hyprctl_exit_status(tmp: Path) -> None:
     Hyprland 0.56 reports no plugin path, so the listing can only ever be a
     name match. It must never stand in for hyprctl's own exit status.
     """
-    env = _load_stub(tmp / "rc", '[{"name":"dynamic-cursors"}]', load_exit=1)
+    env = _load_stub(tmp / "rc", '[{"name":"omacursorshake"}]', load_exit=1)
     env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
     proc = _run_load(env)
     assert_true(proc.returncode != 0, "load succeeded despite hyprctl failing")
@@ -768,7 +737,7 @@ def test_foreign_plugin_is_not_claimed_as_ours(tmp: Path) -> None:
     # Something matching is already loaded before we do anything, and no
     # record of our own load exists for this instance.
     Path(env["STUB_LOADED"]).touch()
-    env["STUB_LISTED_AFTER"] = '[{"name":"dynamic-cursors"}]'
+    env["STUB_LISTED_AFTER"] = '[{"name":"omacursorshake"}]'
     proc = _run_load(env)
     assert_true(proc.returncode != 0, "a foreign plugin was claimed as ours")
     assert_true(b"cannot prove is ours" in proc.stderr, f"err: {proc.stderr!r}")
@@ -776,10 +745,10 @@ def test_foreign_plugin_is_not_claimed_as_ours(tmp: Path) -> None:
 
 def test_maps_has_matches_exact_pathname(tmp: Path) -> None:
     """A maps line counts only when the pathname is exactly our .so."""
-    so = tmp / "omarchy" / "omacursorshake" / "dynamic-cursors.so"
+    so = tmp / "omarchy" / "omacursorshake" / "omacursorshake.so"
     so.parent.mkdir(parents=True)
     so.write_bytes(b"ELF-STUB\n")
-    other = tmp / "hyprpm" / "dynamic-cursors.so"
+    other = tmp / "hyprpm" / "omacursorshake.so"
     other.parent.mkdir(parents=True)
     other.write_bytes(b"OTHER\n")
     maps = tmp / "maps"
@@ -815,7 +784,7 @@ def test_mapped_so_is_claimed_as_ours(tmp: Path) -> None:
     """
     env = _load_stub(tmp, "[]", load_exit=1)
     env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
-    so = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake" / "dynamic-cursors.so"
+    so = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake" / "omacursorshake.so"
     fd = os.open(so, os.O_RDONLY)
     mapping = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
     load_log = tmp / "hyprctl-load.log"
@@ -825,7 +794,7 @@ def test_mapped_so_is_claimed_as_ours(tmp: Path) -> None:
         "case \"$*\" in\n"
         "  *version*) printf '{\"commit\":\"efb50993780079460b0cbed1363e2166a2de1d9f\"}\\n' ;;\n"
         f"  *instances*) printf '[{{\"instance\":\"test_instance\",\"pid\":{os.getpid()}}}]\\n' ;;\n"
-        "  *'plugin list'*) printf '[{\"name\":\"dynamic-cursors\"}]\\n' ;;\n"
+        "  *'plugin list'*) printf '[{\"name\":\"omacursorshake\"}]\\n' ;;\n"
         "  *'plugin load'*) echo LOAD_ATTEMPTED >> \"$0.log\"; exit 1 ;;\n"
         "  *) printf 'ok\\n' ;;\n"
         "esac\n"
@@ -849,7 +818,7 @@ def test_mapped_so_is_claimed_as_ours(tmp: Path) -> None:
 
 def test_confirmed_load_is_recorded_per_instance(tmp: Path) -> None:
     """The happy path still works, and the proof is scoped to one instance."""
-    env = _load_stub(tmp / "ok", '[{"name":"dynamic-cursors"}]', load_exit=0)
+    env = _load_stub(tmp / "ok", '[{"name":"omacursorshake"}]', load_exit=0)
     env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
     proc = _run_load(env)
     assert_true(proc.returncode == 0, f"load failed: {proc.stderr!r}")
@@ -882,7 +851,7 @@ def test_cursor_theme_option_injection_refused(tmp: Path) -> None:
         f"echo \"$*\" >> {argv_log}\n"
         "case \"$*\" in\n"
         "  *version*) printf '{\"commit\":\"efb50993780079460b0cbed1363e2166a2de1d9f\"}\\n' ;;\n"
-        "  *'plugin list'*) printf '[{\"name\":\"dynamic-cursors\"}]\\n' ;;\n"
+        "  *'plugin list'*) printf '[{\"name\":\"omacursorshake\"}]\\n' ;;\n"
         "  *) printf 'ok\\n' ;;\n"
         "esac\n"
     )
@@ -926,6 +895,12 @@ def test_tree_digest_is_canonical(tmp: Path) -> None:
     # .git differs between clones and is not compiled; it must not be hashed.
     (a / ".git" / "config").write_bytes(b"[core]\n\tfsmonitor = evil\n")
     assert_true(tree_digest(a) == da, ".git is being hashed")
+    # Build output lives in out/ and must not move the digest after make.
+    (a / "out").mkdir()
+    (a / "out" / "omacursorshake.so").write_bytes(b"ELF\n")
+    assert_true(tree_digest(a) == da, "out/ is being hashed")
+    (a / "README.md").write_bytes(b"docs\n")
+    assert_true(tree_digest(a) == da, "README.md is being hashed")
 
     (a / "src" / "a.cpp").write_bytes(b"int main(){ }\n")
     assert_true(tree_digest(a) != da, "content change did not move the digest")
@@ -973,69 +948,42 @@ def test_tree_digest_refuses_links_and_specials(tmp: Path) -> None:
     assert_true(b"not a regular file" in proc.stderr, f"err: {proc.stderr!r}")
 
 
-def test_source_digest_gate_runs_before_make(tmp: Path) -> None:
-    """A tree that is not the reviewed source must not reach the compiler."""
-    good = b"// the reviewed source\n"
-    reference = tmp / "reference"
-    reference.mkdir()
-    (reference / ".git").mkdir()
-    (reference / "source.cpp").write_bytes(good)
-    expected = tree_digest(reference)
-    backend = patched_backend(tmp, expected)
-
-    env = backend_env(tmp, tmp / "ok" / "state")
-    env["STUB_SRC"] = good.decode()
-    env["STUB_ARGV_LOG"] = str(tmp / "make-ok.log")
-    proc = subprocess.run(
-        ["bash", str(backend), "ensure"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-    )
-    assert_true(proc.returncode == 0, f"matching tree refused: {proc.stderr!r}")
-    assert_true((tmp / "make-ok.log").exists(), "make never ran on the matching tree")
-
-    # One byte different: the commit SHA and the clean-tree check still pass,
-    # because the stub git reports what it is told to. Only the digest reads
-    # the bytes.
-    env = backend_env(tmp, tmp / "bad" / "state")
-    env["STUB_SRC"] = "// the reviewed sourc3\n"
-    argv_log = tmp / "make-bad.log"
+def test_native_change_forces_rebuild(tmp: Path) -> None:
+    """A later edit to the vendored tree must not reuse the previous .so."""
+    native = stub_native(tmp, b"// version one\n")
+    env = backend_env(tmp, tmp / "state", native)
+    argv_log = tmp / "make-1.log"
     env["STUB_ARGV_LOG"] = str(argv_log)
     proc = subprocess.run(
-        ["bash", str(backend), "ensure"],
+        ["bash", str(BACKEND), "ensure"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
     )
-    assert_true(proc.returncode != 0, "tampered tree was built")
-    assert_true(b"digest is" in proc.stderr, f"err: {proc.stderr!r}")
-    assert_true(not argv_log.exists(), "make ran before the digest gate refused the tree")
-    assert_true(
-        not (tmp / "bad" / "state" / "omarchy" / "omacursorshake" / "dynamic-cursors.so").exists(),
-        "a .so was installed from a tampered tree",
+    assert_true(proc.returncode == 0, f"first ensure failed: {proc.stderr!r}")
+    first = json.loads((tmp / "state" / "omarchy" / "omacursorshake" / "built-for").read_text())
+
+    (native / "src" / "main.cpp").write_bytes(b"// version two\n")
+    argv_log2 = tmp / "make-2.log"
+    env["STUB_ARGV_LOG"] = str(argv_log2)
+    proc = subprocess.run(
+        ["bash", str(BACKEND), "ensure"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
     )
+    assert_true(proc.returncode == 0, f"rebuild failed: {proc.stderr!r}")
+    assert_true(argv_log2.exists(), "changed source was reused without make")
+    second = json.loads((tmp / "state" / "omarchy" / "omacursorshake" / "built-for").read_text())
+    assert_true(second["sourceDigest"] != first["sourceDigest"], "digest did not move")
+    assert_true(second["sourceDigest"] == tree_digest(native), "stamp is not the new tree")
 
 
-def test_every_pin_has_a_source_digest() -> None:
-    """No Hyprland version may map to a plugin commit we have not attested."""
-    text = BACKEND.read_text()
-
-    def case_body(name: str) -> str:
-        start = text.index(f"{name}() {{")
-        return text[start : text.index("\n}\n", start)]
-
-    entry = re.compile(r'^\s*([0-9a-f]{40})\) echo "([0-9a-f]{40,64})" ;;', re.M)
-    revs = {v for _, v in entry.findall(case_body("plugin_rev_for"))}
-    digests = {k: v for k, v in entry.findall(case_body("plugin_digest_for"))}
-    assert_true(bool(revs), "no pinned plugin commits found")
-    missing = sorted(revs - set(digests))
-    assert_true(not missing, f"pins without a source digest: {missing}")
-    stale = sorted(set(digests) - revs)
-    assert_true(not stale, f"digests for commits nothing maps to: {stale}")
-    for rev, d in digests.items():
-        assert_true(len(d) == 64, f"{rev}: digest is not sha256: {d}")
-
-    assert_true("plugin_digest_for" in case_body("verify_source_tree"),
-                "verify_source_tree does not consult the digest table")
-    assert_true("tree-digest" in case_body("verify_source_tree"),
-                "verify_source_tree does not digest the checked-out tree")
+def test_backend_has_no_remote_fetch() -> None:
+    """The reviewed native tree is the only source; nothing is cloned at runtime."""
+    src = BACKEND.read_text()
+    assert_true("git clone" not in src, "backend still clones")
+    assert_true("github.com/VirtCode" not in src, "backend still names upstream")
+    assert_true("plugin_rev_for" not in src, "upstream pin table is back")
+    assert_true("tree-digest-fd" in backend_section("verify_source_tree"),
+                "verify_source_tree does not digest the pinned native tree")
+    assert_true("OMACURSORSHAKE_NATIVE" in src, "native tree is not overridable for tests")
 
 
 def test_legacy_stamp_forces_a_rebuild(tmp: Path) -> None:
@@ -1048,22 +996,21 @@ def test_legacy_stamp_forces_a_rebuild(tmp: Path) -> None:
     state = tmp / "state"
     sdir = state / "omarchy" / "omacursorshake"
     sdir.mkdir(parents=True)
-    (sdir / "dynamic-cursors.so").write_bytes(b"OLD-UNVERIFIED-ARTIFACT\n")
+    (sdir / "omacursorshake.so").write_bytes(b"OLD-UNVERIFIED-ARTIFACT\n")
     # Exactly what the old code wrote: the Hyprland commit, nothing else.
     (sdir / "built-for").write_text(HL_0562 + "\n")
 
     env = backend_env(tmp, state)
     argv_log = tmp / "make-ran.log"
     env["STUB_ARGV_LOG"] = str(argv_log)
-    backend = patched_backend(tmp, empty_tree_digest(tmp))
     proc = subprocess.run(
-        ["bash", str(backend), "ensure"],
+        ["bash", str(BACKEND), "ensure"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
     )
     assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
     assert_true(argv_log.exists(), "legacy stamp was accepted; the old .so was never rebuilt")
     assert_true(
-        (sdir / "dynamic-cursors.so").read_bytes() != b"OLD-UNVERIFIED-ARTIFACT\n",
+        (sdir / "omacursorshake.so").read_bytes() != b"OLD-UNVERIFIED-ARTIFACT\n",
         "the unverified artifact is still installed",
     )
     stamp = json.loads((sdir / "built-for").read_text())
@@ -1075,7 +1022,6 @@ def test_attestation_mismatch_blocks_reuse_and_load(tmp: Path) -> None:
     for label, override, content in (
         ("tampered bytes", {}, b"REPLACED-AFTER-INSTALL\n"),
         ("stale pipeline", {"pipeline": 1}, None),
-        ("foreign pin", {"pluginRev": "0" * 40}, None),
         ("wrong source digest", {"sourceDigest": "b" * 64}, None),
     ):
         # A listing that lets an otherwise-legitimate load run to completion,
@@ -1084,16 +1030,20 @@ def test_attestation_mismatch_blocks_reuse_and_load(tmp: Path) -> None:
         # listed", which would prove nothing about the gate.
         env = _load_stub(
             tmp / label.replace(" ", "-"),
-            '[{"name":"dynamic-cursors"}]',
+            '[{"name":"omacursorshake"}]',
             load_exit=0,
         )
         env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
         state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
         if content is not None:
             # Stamp stays valid; only the file it attests changes.
-            (state / "dynamic-cursors.so").write_bytes(content)
+            (state / "omacursorshake.so").write_bytes(content)
         else:
-            seed_attested_so(state, **override)
+            seed_attested_so(
+                state,
+                source_digest=tree_digest(Path(env["OMACURSORSHAKE_NATIVE"])),
+                **override,
+            )
         proc = _run_load(env)
         assert_true(proc.returncode != 0, f"{label}: load was allowed")
         assert_true(
@@ -1109,10 +1059,10 @@ def test_substring_path_is_not_claimed_as_ours(tmp: Path) -> None:
     """A listed path that merely contains ours is a different binary."""
     env = _load_stub(tmp / "substr", "[]", load_exit=0)
     state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
-    ours = str(state / "dynamic-cursors.so")
+    ours = str(state / "omacursorshake.so")
     Path(env["STUB_LOADED"]).touch()
     for decoy in (ours + ".bak", "/opt/vendor" + ours):
-        env["STUB_LISTED_AFTER"] = json.dumps([{"name": "dynamic-cursors", "path": decoy}])
+        env["STUB_LISTED_AFTER"] = json.dumps([{"name": "omacursorshake", "path": decoy}])
         proc = _run_load(env)
         assert_true(proc.returncode != 0, f"{decoy} was claimed as ours")
         assert_true(b"cannot prove is ours" in proc.stderr, f"err: {proc.stderr!r}")
@@ -1151,18 +1101,17 @@ def test_settings_ranges_are_enforced(tmp: Path) -> None:
 def test_source_tree_is_pinned_by_descriptor(tmp: Path) -> None:
     """Digest, compile, and install must all address one held descriptor.
 
-    Re-resolving $SRC_DIR by name after the digest left a window in which the
+    Re-resolving $NATIVE_DIR by name after the digest left a window in which the
     verified tree could be swapped for another before make read it.
     """
     body = backend_section("cmd_ensure")
     assert_true("exec {srcfd}<" in body, "source tree is not pinned by descriptor")
-    assert_true("tree-digest-fd" in body or "tree-digest-fd" in backend_section(
-        "verify_source_tree"), "digest does not use the pinned descriptor")
+    assert_true("tree-digest-fd" in backend_section("verify_source_tree"),
+                "digest does not use the pinned descriptor")
     assert_true("env --chdir=" in body, "make is not run through the pinned descriptor")
     assert_true(
-        'make -f Makefile -C "$SRC_DIR"' not in BACKEND.read_text()
-        and 'copy" "$SRC_DIR' not in BACKEND.read_text(),
-        "a build step still re-resolves $SRC_DIR by name",
+        'make -C "$NATIVE_DIR"' not in BACKEND.read_text(),
+        "a build step still re-resolves $NATIVE_DIR by name",
     )
 
     # Functional proof: swap the directory out from under the open fd and the
@@ -1170,13 +1119,13 @@ def test_source_tree_is_pinned_by_descriptor(tmp: Path) -> None:
     real, evil = tmp / "real", tmp / "evil"
     (real / "out").mkdir(parents=True)
     (evil / "out").mkdir(parents=True)
-    (real / "out" / "dynamic-cursors.so").write_bytes(b"VERIFIED\n")
-    (evil / "out" / "dynamic-cursors.so").write_bytes(b"SWAPPED\n")
-    dest = tmp / "state" / "dynamic-cursors.so"
+    (real / "out" / "omacursorshake.so").write_bytes(b"VERIFIED\n")
+    (evil / "out" / "omacursorshake.so").write_bytes(b"SWAPPED\n")
+    dest = tmp / "state" / "omacursorshake.so"
     dest.parent.mkdir(parents=True)
     script = (
         'exec {fd}<"$1"; mv "$1" "$1.gone"; mv "$4" "$1"; '
-        'exec python3 "$2" copy-fd $fd out/dynamic-cursors.so "$3" 0755'
+        'exec python3 "$2" copy-fd $fd out/omacursorshake.so "$3" 0755'
     )
     subprocess.run(
         ["bash", "-c", script, "_", str(real), str(STATEIO), str(dest), str(evil)],
@@ -1258,8 +1207,9 @@ def main() -> int:
         test_hyprctl_calls_are_time_bounded,
         test_hyprctl_output_is_byte_bounded,
         test_gnumakefile_precedence_is_defeated,
-        test_planted_source_tree_is_destroyed,
-        test_checkout_must_match_the_pin,
+        test_ensure_does_not_invoke_git,
+        test_native_dir_symlink_is_resolved,
+        test_plugin_install_symlink_status,
         test_load_requires_hyprctl_exit_status,
         test_foreign_plugin_is_not_claimed_as_ours,
         test_maps_has_matches_exact_pathname,
@@ -1268,8 +1218,8 @@ def main() -> int:
         test_cursor_theme_option_injection_refused,
         test_tree_digest_is_canonical,
         test_tree_digest_refuses_links_and_specials,
-        test_source_digest_gate_runs_before_make,
-        test_every_pin_has_a_source_digest,
+        test_native_change_forces_rebuild,
+        test_backend_has_no_remote_fetch,
         test_legacy_stamp_forces_a_rebuild,
         test_attestation_mismatch_blocks_reuse_and_load,
         test_substring_path_is_not_claimed_as_ours,
@@ -1283,7 +1233,7 @@ def main() -> int:
         tmp = Path(tempfile.mkdtemp(prefix="stateio-test-"))
         try:
             if test in (test_source_never_reopens_full_path, test_watchdog_and_installer_guards,
-                        test_every_pin_has_a_source_digest):
+                        test_backend_has_no_remote_fetch):
                 test()
             else:
                 test(tmp)

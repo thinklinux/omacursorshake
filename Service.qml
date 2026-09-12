@@ -3,11 +3,13 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Hyprland
 
-// Headless owner of hypr-dynamic-cursors. Loaded with the shell, independent
-// of the bar widget, so shake-to-find keeps working with the panel closed.
+// Headless owner of the vendored shake-only Hyprland plugin. Loaded with the
+// shell, independent of the bar widget, so shake-to-find keeps working with
+// the panel closed.
 //
-// Nothing here writes ~/.config/hypr/: the compositor plugin is built into
-// state dir, loaded with hyprctl, and re-applied after Hyprland config reloads.
+// Nothing here writes ~/.config/hypr/: the compositor plugin is built from
+// native/ into the state dir, loaded with hyprctl, and re-applied after
+// Hyprland config reloads.
 Item {
   id: root
 
@@ -60,9 +62,9 @@ Item {
   property string generation: ""
   property double lastApplyAt: 0
   readonly property int diagnosticMaxChars: 480
-  // Longest legitimate job is a full build: clone + fetch + checkout + make,
-  // whose backend-side timeouts total 570s. Anything past this margin means a
-  // child escaped its timeout, and the queue must not stay wedged forever.
+  // Longest legitimate job is a full native build (MAKE_TIMEOUT 300s).
+  // Anything past this margin means a child escaped its timeout, and the
+  // queue must not stay wedged forever.
   readonly property int jobWatchdogMs: 900000
   property bool jobTimedOut: false
 
