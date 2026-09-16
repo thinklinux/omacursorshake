@@ -18,6 +18,7 @@
 #include <hyprland/src/helpers/math/Math.hpp>
 #include <hyprlang.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <climits>
@@ -30,12 +31,35 @@
 #include "mode/utils.hpp"
 #include "render/CursorPassElement.hpp"
 
+static int monitorHzOr(int fallback) {
+    if (!g_pHyprRenderer->m_mostHzMonitor)
+        return fallback;
+    const double hz = g_pHyprRenderer->m_mostHzMonitor->m_refreshRate;
+    if (!std::isfinite(hz) || hz <= 0)
+        return fallback;
+    return std::clamp(static_cast<int>(std::lround(hz)), 1, kMaxShakeHz);
+}
+
 void tickRaw(SP<CEventLoopTimer> self, void* data) {
-    if (g_pConfigHandler->isEnabled())
+    if (g_pConfigHandler && g_pConfigHandler->isEnabled() && g_pDynamicCursors)
         g_pDynamicCursors->onTick(Pointer::mgr().get());
 
-    const int TIMEOUT = g_pHyprRenderer->m_mostHzMonitor && g_pHyprRenderer->m_mostHzMonitor->m_refreshRate > 0 ? 1000.0 / g_pHyprRenderer->m_mostHzMonitor->m_refreshRate : 16;
-    self->updateTimeout(std::chrono::milliseconds(TIMEOUT));
+    self->updateTimeout(std::chrono::milliseconds(1000 / monitorHzOr(60)));
+}
+
+// pixman_box32 is int32_t. Huge or non-finite CBoxes make pixman_region32_union
+// abort the compositor (glibc "corrupted size vs. prev_size").
+static bool isPixmanSafeBox(const CBox& b) {
+    if (!std::isfinite(b.x) || !std::isfinite(b.y) || !std::isfinite(b.w) || !std::isfinite(b.h))
+        return false;
+    if (b.w <= 0 || b.h <= 0 || b.w > 8192 || b.h > 8192)
+        return false;
+    constexpr double kLim = 100000.0;
+    if (std::abs(b.x) > kLim || std::abs(b.y) > kLim)
+        return false;
+    if (b.x + b.w > kLim || b.y + b.h > kLim)
+        return false;
+    return true;
 }
 
 CDynamicCursors::CDynamicCursors() {
@@ -165,22 +189,23 @@ void CDynamicCursors::damageSoftware(Pointer::CPointerManager* pointers) {
     const auto imageScale = pointers->m_currentCursorImage.scale;
     if (!std::isfinite(zoom) || zoom <= 0)
         zoom = 1;
+    else if (zoom > kMaxCursorZoom)
+        zoom = kMaxCursorZoom;
     if (!std::isfinite(imageScale) || imageScale <= 0)
         return;
 
     Vector2D size = pointers->m_currentCursorImage.size / imageScale * zoom;
-    if (!std::isfinite(size.x) || !std::isfinite(size.y) || size.x < 0 || size.y < 0)
+    if (!std::isfinite(size.x) || !std::isfinite(size.y) || size.x <= 0 || size.y <= 0)
         return;
 
-    // Unbounded shake zoom produced boxes large enough for pixman_region32_union
-    // to abort the compositor (double free / invalid size).
     double diagonal = size.size();
     if (!std::isfinite(diagonal) || diagonal > 4096)
         return;
     Vector2D padding = {diagonal, diagonal};
 
     CBox b = CBox{pointers->m_pointerPos, size + (padding * 2)}.translate(-(pointers->m_currentCursorImage.hotspot * zoom + padding));
-    if (!std::isfinite(b.x) || !std::isfinite(b.y) || !std::isfinite(b.w) || !std::isfinite(b.h))
+    b.noNegativeSize();
+    if (!isPixmanSafeBox(b))
         return;
 
     static auto PNOHW = CConfigValue<Hyprlang::INT>("cursor:no_hardware_cursors");
@@ -206,9 +231,17 @@ SP<Aquamarine::IBuffer> CDynamicCursors::renderHardware(Pointer::CPointerManager
 
     auto maxSize = output->cursorPlaneSize();
     auto zoom    = resultShown.scale;
+    if (!std::isfinite(zoom) || zoom <= 0)
+        zoom = 1;
+    else if (zoom > kMaxCursorZoom)
+        zoom = kMaxCursorZoom;
 
     auto cursorSize     = pointers->m_currentCursorImage.size * zoom;
-    int  cursorDiagonal = cursorSize.size();
+    if (!std::isfinite(cursorSize.x) || !std::isfinite(cursorSize.y) || cursorSize.x <= 0 || cursorSize.y <= 0)
+        return nullptr;
+    double cursorDiagonal = cursorSize.size();
+    if (!std::isfinite(cursorDiagonal) || cursorDiagonal > 4096)
+        return nullptr;
     auto cursorPadding  = Vector2D{cursorDiagonal, cursorDiagonal};
     auto targetSize     = cursorSize + cursorPadding * 2;
 
@@ -269,7 +302,10 @@ SP<Aquamarine::IBuffer> CDynamicCursors::renderHardware(Pointer::CPointerManager
         return nullptr;
     }
 
-    CRegion damage = {0, 0, INT16_MAX, INT16_MAX};
+    const Vector2D bufferSize = state->monitor->m_cursorSwapchain->currentOptions().size;
+    if (!std::isfinite(bufferSize.x) || !std::isfinite(bufferSize.y) || bufferSize.x <= 0 || bufferSize.y <= 0)
+        return nullptr;
+    CRegion damage = CBox{{}, bufferSize};
 
     g_pHyprRenderer->m_renderData.pMonitor = state->monitor;
     auto RBO                               = g_pHyprRenderer->getOrCreateRenderbuffer(buf, state->monitor->m_cursorSwapchain->currentOptions().format);
@@ -280,7 +316,7 @@ SP<Aquamarine::IBuffer> CDynamicCursors::renderHardware(Pointer::CPointerManager
 
     RBO->bind();
 
-    CRegion damageRegion = {0, 0, INT_MAX, INT_MAX};
+    CRegion damageRegion = CBox{{}, bufferSize};
     g_pHyprRenderer->beginFullFakeRender(state->monitor.lock(), damageRegion, RBO->getFB());
     g_pHyprRenderer->startRenderPass();
 
@@ -423,8 +459,8 @@ void CDynamicCursors::calculate(EModeUpdate type) {
     result.scale *= resultShake;
     if (!std::isfinite(result.scale) || result.scale < 1)
         result.scale = 1;
-    else if (result.scale > 32)
-        result.scale = 32;
+    else if (result.scale > kMaxCursorZoom)
+        result.scale = kMaxCursorZoom;
 
     if (resultShown.hasDifference(&result, CONFIG(threshold) * (std::numbers::pi / 180.0), 0.01, 0.01)) {
         resultShown = result;

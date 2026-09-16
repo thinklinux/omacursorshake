@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include <hyprland/src/animation/AnimationManager.hpp>
@@ -27,19 +28,44 @@ CShake::CShake() {
         Animation::mgr()->addBezierWithName(bezier, {0.22, 1.0}, {0.36, 1.0});
     });
 
-    // wtf is this struct, what is pValues?
-    static SP<SAnimationPropertyConfig> properties = makeShared<SAnimationPropertyConfig>();
-    properties->internalBezier                     = bezier;
-    properties->internalSpeed                      = time / 100.f;
-    properties->internalEnabled                    = 1;
-    properties->pValues                            = properties;
+    // Member, not static: a .so-static SP survives dlclose with STB_GNU_UNIQUE
+    // and then dangles on the next load. pValues is a weak self-ref (Hyprland idiom).
+    m_animProps                    = makeShared<SAnimationPropertyConfig>();
+    m_animProps->internalBezier    = bezier;
+    m_animProps->internalSpeed     = time / 100.f;
+    m_animProps->internalEnabled   = 1;
+    m_animProps->pValues           = m_animProps;
 
-    Animation::mgr()->createAnimation(1.f, zoom, properties, AVARDAMAGE_NONE);
+    Animation::mgr()->createAnimation(1.f, zoom, m_animProps, AVARDAMAGE_NONE);
+}
+
+CShake::~CShake() {
+    m_bezierReload.reset();
+    if (zoom) {
+        zoom->resetAllCallbacks();
+        if (zoom->ok())
+            zoom->warp(false, true);
+    }
+}
+
+float CShake::clampZoom(float z) const {
+    if (!std::isfinite(z) || z < 1.f)
+        return 1.f;
+    float cap = CONFIG(shakeLimit);
+    if (!(cap > 1.f) || !std::isfinite(cap))
+        cap = kMaxCursorZoom;
+    cap = std::min(cap, kMaxCursorZoom);
+    return std::min(z, cap);
 }
 
 double CShake::update(Vector2D pos) {
 
-    int max = std::max(1, (int)(g_pHyprRenderer->m_mostHzMonitor->m_refreshRate)); // 1s worth of history, avoiding divide by 0
+    int max = 60;
+    if (g_pHyprRenderer->m_mostHzMonitor) {
+        const double hz = g_pHyprRenderer->m_mostHzMonitor->m_refreshRate;
+        if (std::isfinite(hz) && hz > 0)
+            max = std::clamp(static_cast<int>(std::lround(hz)), 1, kMaxShakeHz);
+    }
     samples.resize(max);
     samples_distance.resize(max);
     samples_index = std::min(samples_index, max - 1);
@@ -77,10 +103,7 @@ double CShake::update(Vector2D pos) {
         if (!started)
             next = CONFIG(shakeBase);                                                      // start on base zoom
         next += delta * (CONFIG(shakeSpeed) + (amount * amount) * CONFIG(shakeInfluence)); // increase when moving
-
-        float limit = CONFIG(shakeLimit);
-        if (limit > 1)
-            next = std::min(limit, next); // limit overall zoom
+        next = clampZoom(next);
 
         *this->zoom = next;
         this->end   = steady_clock::now() + milliseconds(CONFIG(shakeTimeout));
@@ -113,7 +136,7 @@ double CShake::update(Vector2D pos) {
 
 void CShake::force(std::optional<int> duration, std::optional<float> size) {
     started     = true;
-    *this->zoom = size.value_or(CONFIG(shakeBase));
+    *this->zoom = clampZoom(size.value_or(CONFIG(shakeBase)));
     this->end   = steady_clock::now() + milliseconds(duration.value_or(CONFIG(shakeTimeout)));
 }
 

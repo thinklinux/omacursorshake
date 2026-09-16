@@ -32,7 +32,7 @@ LOADED_IN_PATH="$STATE_DIR/loaded-in"
 # the digests, and cmd_ensure refuses to reuse an .so that was not produced by
 # the current generation. Bump this whenever a change to the build path makes
 # an older artifact no longer trustworthy.
-PIPELINE_VERSION=3
+PIPELINE_VERSION=4
 DIAG_BYTES=2048
 LOG_BUDGET=65536
 IPC_TIMEOUT=5

@@ -1,7 +1,10 @@
 #include <hyprland/src/helpers/AnimatedVariable.hpp>
 #include <hyprutils/animation/AnimatedVariable.hpp>
+#include <hyprutils/animation/AnimationConfig.hpp>
 #include <hyprutils/math/Vector2D.hpp>
+#include <hyprutils/memory/SharedPtr.hpp>
 #include <hyprutils/signal/Listener.hpp>
+#include <optional>
 #include <vector>
 
 #define IPC_SHAKE_START  "shakestart"
@@ -12,9 +15,15 @@ using namespace Hyprutils::Math;
 using namespace Hyprutils::Animation;
 using namespace std::chrono;
 
+// Hard ceiling for shake zoom. plugin:omacursorshake:shake:limit 0 means
+// "unlimited" upstream; that grew damage boxes until pixman aborted Hyprland.
+constexpr float kMaxCursorZoom = 32.f;
+constexpr int   kMaxShakeHz    = 240;
+
 class CShake {
   public:
     CShake();
+    ~CShake();
 
     /* calculates the new zoom factor for the current pos */
     double update(Vector2D pos);
@@ -25,11 +34,14 @@ class CShake {
     void force(std::optional<int> duration, std::optional<float> size);
 
   private:
+    float clampZoom(float z) const;
+
     /* tracks whether the current shake has already been announced in the ipc */
     bool ipc = false;
 
     bool                     started = false;
     PHLANIMVAR<float>        zoom;
+    SP<SAnimationPropertyConfig> m_animProps;
     steady_clock::time_point end;
 
     /* ringbuffer for last samples */
