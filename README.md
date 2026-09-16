@@ -74,6 +74,43 @@ you want it gone.
   the plugin refuses to read or publish state rather than risk a swapped
   component. The path itself must not contain `[` or `]`.
 
+## Build and execution trust boundary
+
+This plugin compiles a shared object and hands it to Hyprland to `dlopen`, so
+nothing about which binaries run, or what steers them, is left to the ambient
+environment.
+
+- **Interpreters are absolute.** `Service.qml` spawns `/usr/bin/bash -p` and
+  `/usr/bin/python3 -I`, never a name resolved through `PATH`. `-p` makes bash
+  ignore `BASH_ENV`/`ENV` and refuse exported functions; `-I` keeps python out
+  of `PYTHONPATH`/`PYTHONHOME` and off the script directory's `sys.path`.
+- **Children get an explicit environment.** Every spawn sets
+  `clearEnvironment: true` and passes a short allowlist: a literal
+  `PATH=/usr/bin:/bin` plus `HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`,
+  `HYPRLAND_INSTANCE_SIGNATURE`, `DBUS_SESSION_BUS_ADDRESS`, `LANG` and the
+  cursor-theme names (whose values are allowlisted before they reach
+  `hyprctl`). Nothing else is inherited.
+- **Tools are resolved, then validated.** `bin/backend.sh` pins
+  `TRUSTED_BIN_DIRS=(/usr/bin /bin)`, replaces `PATH` with it, and resolves
+  every executable through `stateio.py resolve-tools`, which requires a regular,
+  executable file that is not group/other writable and does not resolve out of
+  those directories. There is no environment override for that list; the tests
+  patch the constant in a copy of the script.
+- **The build sees almost nothing.** `make` runs under `env -i` with an
+  explicit `PATH` and `LC_ALL`, and is given `CXX`, `PKG_CONFIG`, `SED`,
+  `LDFLAGS=` and `EXTRA_CXXFLAGS=` on the command line, where they outrank both
+  the environment and the makefile. An inherited `CXX`, `LDFLAGS`,
+  `EXTRA_CXXFLAGS`, `PKG_CONFIG_PATH`, `CPATH` or `LD_PRELOAD` cannot reach the
+  compiler, and `-f Makefile` pins the file itself.
+- **The source tree is fixed.** `native/` under the plugin root is the only
+  thing that is ever compiled; no variable selects another tree. It is digested,
+  pinned by descriptor, compiled and copied out through that same descriptor,
+  and the installed `.so` is attested by digest before it is loaded.
+
+`bin/test_stateio.py` covers this: a hostile `PATH` full of shadowed tools must
+leave no trace, and a build launched with twenty poisoned toolchain variables
+must show none of them in `make`'s environment.
+
 ## License
 
 MIT. See [LICENSE](LICENSE). The vendored compositor plugin in `native/` is

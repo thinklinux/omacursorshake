@@ -26,6 +26,42 @@ Item {
     || ((Quickshell.env("HOME") || "") + "/.local/state")
   readonly property string stateDir: stateHome + "/omarchy/omacursorshake"
   readonly property string settingsPath: stateDir + "/settings.json"
+  readonly property string stateio: pluginDir + "bin/stateio.py"
+
+  // Absolute interpreters, never resolved through PATH. Whatever this shell
+  // inherited could otherwise decide which `bash` and `python3` run, and this
+  // backend compiles the .so that Hyprland dlopens.
+  readonly property string bashPath: "/usr/bin/bash"
+  readonly property string pythonPath: "/usr/bin/python3"
+  readonly property string notifyPath: "/usr/share/omarchy/bin/omarchy-notification-send"
+  readonly property string trustedPath: "/usr/bin:/bin"
+  readonly property string notifySearchPath: "/usr/share/omarchy/bin:/usr/bin:/bin"
+
+  // The only names a child may inherit. Everything else is dropped by
+  // clearEnvironment and never reinstated -- PATH itself, BASH_ENV, PYTHONPATH,
+  // LD_PRELOAD, CC/CXX/CXXFLAGS/LDFLAGS/EXTRA_CXXFLAGS, PKG_CONFIG_PATH,
+  // LOCPATH -- so nothing inherited can steer the build or the load. The
+  // cursor-theme names survive because the backend already allowlists their
+  // values before they reach hyprctl.
+  readonly property var passThroughEnv: [
+    "HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "HYPRLAND_INSTANCE_SIGNATURE",
+    "DBUS_SESSION_BUS_ADDRESS", "LANG",
+    "HYPRCURSOR_THEME", "HYPRCURSOR_SIZE", "XCURSOR_THEME", "XCURSOR_SIZE"
+  ]
+
+  function trustedEnv(searchPath) {
+    var env = { "PATH": searchPath }
+    for (var i = 0; i < passThroughEnv.length; i++) {
+      var name = passThroughEnv[i]
+      var value = Quickshell.env(name)
+      if (value !== null && value !== undefined && String(value) !== "")
+        env[name] = String(value)
+    }
+    return env
+  }
+
+  readonly property var backendEnv: trustedEnv(trustedPath)
+  readonly property var notifyEnv: trustedEnv(notifySearchPath)
 
   readonly property var defaultSettings: ({
     enabled: true,
@@ -141,19 +177,19 @@ Item {
       phase = loaded ? "loading" : "building"
       statusText = loaded ? "Applying…" : "Building the cursor plugin…"
       building = !loaded
-      job.command = ["bash", backend, "ensure"]
+      job.command = [bashPath, "-p", backend, "ensure"]
     } else if (name === "load") {
       phase = "loading"
       statusText = "Loading into Hyprland…"
-      job.command = ["bash", backend, "load", settingsJson()]
+      job.command = [bashPath, "-p", backend, "load", settingsJson()]
     } else if (name === "apply") {
-      job.command = ["bash", backend, "apply", settingsJson()]
+      job.command = [bashPath, "-p", backend, "apply", settingsJson()]
     } else if (name === "disable") {
       phase = "disabled"
       statusText = "Shake to find is off"
-      job.command = ["bash", backend, "unload", settingsJson()]
+      job.command = [bashPath, "-p", backend, "unload", settingsJson()]
     } else if (name === "status") {
-      job.command = ["bash", backend, "status"]
+      job.command = [bashPath, "-p", backend, "status"]
     } else {
       currentJob = ""
       pump()
@@ -189,14 +225,18 @@ Item {
   }
 
   function notify(title, body) {
-    Quickshell.execDetached([
-      "omarchy-notification-send",
-      "--app-name", "omacursorshake",
-      "-g", "󰍽",
-      "-u", "normal",
-      String(title || ""),
-      root.sanitizeDiagnostic(body)
-    ])
+    Quickshell.execDetached({
+      command: [
+        root.notifyPath,
+        "--app-name", "omacursorshake",
+        "-g", "󰍽",
+        "-u", "normal",
+        String(title || ""),
+        root.sanitizeDiagnostic(body)
+      ],
+      clearEnvironment: true,
+      environment: root.notifyEnv
+    })
   }
 
   function reapply() {
@@ -205,7 +245,11 @@ Item {
 
   function claimOwner() {
     root.generation = Date.now() + "-" + Math.floor(Math.random() * 1000000)
-    Quickshell.execDetached(["bash", backend, "claim", root.generation])
+    Quickshell.execDetached({
+      command: [bashPath, "-p", backend, "claim", root.generation],
+      clearEnvironment: true,
+      environment: root.backendEnv
+    })
   }
 
   Timer {
@@ -222,6 +266,11 @@ Item {
 
   Process {
     id: job
+    // -p (privileged mode) on top of the cleared environment: bash then also
+    // ignores BASH_ENV and ENV and refuses exported functions, which matters
+    // for anyone running backend.sh by hand from a dirty shell.
+    clearEnvironment: true
+    environment: root.backendEnv
     stdout: StdioCollector { id: jobOut; waitForEnd: true }
     stderr: StdioCollector { id: jobErr; waitForEnd: true }
     onExited: function(code) {
@@ -278,7 +327,11 @@ Item {
 
   Process {
     id: settingsReader
-    command: ["python3", root.pluginDir + "bin/stateio.py", "read", root.settingsPath, "65536"]
+    // -I keeps python out of PYTHONPATH/PYTHONHOME and off the script
+    // directory's sys.path; stateio.py imports nothing but the stdlib.
+    command: [root.pythonPath, "-I", root.stateio, "read", root.settingsPath, "65536"]
+    clearEnvironment: true
+    environment: ({ "PATH": root.trustedPath })
     stdout: StdioCollector { id: settingsOut; waitForEnd: true }
     onExited: function() {
       var text = String(settingsOut.text || "").trim()
@@ -318,6 +371,10 @@ Item {
 
   Component.onDestruction: {
     if (root.generation !== "")
-      Quickshell.execDetached(["bash", root.backend, "unload-if", root.generation])
+      Quickshell.execDetached({
+        command: [root.bashPath, "-p", root.backend, "unload-if", root.generation],
+        clearEnvironment: true,
+        environment: root.backendEnv
+      })
   }
 }

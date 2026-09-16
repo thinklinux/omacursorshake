@@ -45,9 +45,12 @@ CConfigHandler::CConfigHandler() {
     c_ignoreWarps = conf(NS("ignore_warps"), true, "ignore cursor warps");
 
     HyprlandAPI::addDispatcherV2(PHANDLE, NS("magnify"), ::dispatchMagnify);
-    // Config values live at hl.plugin.omacursorshake (plugin:omacursorshake:*).
-    // A Lua C function in that same table overwrites the config proxy and
-    // corrupts the heap on reload / animation setup / cursor damage.
+    // Config values are reachable as plugin:omacursorshake:* and are written
+    // with hl.config(); they do NOT appear as hl.plugin.omacursorshake. Only
+    // this namespace does, so it is also the only thing a Lua snippet can test
+    // to find out whether we are loaded (bin/backend.sh write_apply_lua).
+    // A Lua C function in the config table would overwrite the config proxy and
+    // corrupt the heap on reload / animation setup / cursor damage.
     // Upstream avoids this with dynamic-cursors (config) vs dynamic_cursors (Lua).
     HyprlandAPI::addLuaFunction(PHANDLE, "omacursorshake_api", "dsp_magnify", ::luaMagnifyDispatcher);
 }

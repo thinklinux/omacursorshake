@@ -5,10 +5,69 @@
 
 set -euo pipefail
 
+# Service.qml launches us as `bash -p`, which makes bash ignore BASH_ENV and
+# ENV and refuse exported functions from the environment. These two it still
+# honours, and a stray CDPATH would make the `cd` below print its match into
+# HERE.
+unset CDPATH GLOBIGNORE
+IFS=$' \t\n'
+
+# A direct CLI invocation does not get Service.qml's cleared environment, so
+# drop the variables that steer a loader, an interpreter or a build before
+# anything at all runs. (SHELLOPTS and BASHOPTS are readonly and cannot be
+# unset from inside; `bash -p` is what neutralizes those.) The build on top of
+# this runs under `env -i`, so the compiler never sees an inherited variable
+# even when someone re-exports one mid-script.
+unset BASH_ENV ENV \
+  LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT \
+  PYTHONPATH PYTHONHOME PYTHONSTARTUP \
+  CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS EXTRA_CXXFLAGS \
+  CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH \
+  GCC_EXEC_PREFIX COMPILER_PATH \
+  PKG_CONFIG PKG_CONFIG_PATH PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR \
+  MAKEFLAGS GNUMAKEFLAGS MAKEFILES MAKELEVEL
+
+# Every executable this script runs is resolved to a validated absolute path
+# inside this fixed list, and PATH is replaced with the same list, so nothing
+# the environment carries can introduce or shadow a tool. The build on top of
+# that runs under `env -i` with explicit make variables, so an inherited CXX,
+# LDFLAGS, EXTRA_CXXFLAGS or PKG_CONFIG_PATH cannot steer what ends up
+# compiled into the compositor.
+#
+# There is deliberately no environment override for this list. The tests patch
+# this one line in a copy of the script instead, so the shipped backend has no
+# way for an inherited variable to point it at another toolchain.
+TRUSTED_BIN_DIRS=(/usr/bin /bin)
+
+printf -v TRUSTED_PATH '%s:' "${TRUSTED_BIN_DIRS[@]}"
+TRUSTED_PATH=${TRUSTED_PATH%:}
+export PATH="$TRUSTED_PATH"
+
+# Absolute identities, filled by require_base_tools/require_build_tools before
+# anything is executed through them.
+PY_BIN=""
+JQ_BIN=""
+TIMEOUT_BIN=""
+HEAD_BIN=""
+TAIL_BIN=""
+TR_BIN=""
+UNAME_BIN=""
+ENV_BIN=""
+HYPRCTL_BIN=""
+GSETTINGS_BIN=""
+MAKE_BIN=""
+GXX_BIN=""
+PKGCONFIG_BIN=""
+SED_BIN=""
+
 # Resolve through the plugin-dir symlink that `./install.sh` creates.
 # Logical `pwd` would keep ~/.config/omarchy/plugins/<id>, and tree-digest
 # then refuses that symlink component. Physical paths are the project tree.
-HERE=$(cd -P "$(dirname "$0")" && pwd -P)
+# ${0%/*} rather than dirname(1): no external command runs before the tool
+# preflight has vouched for it.
+SELF=$0
+[[ $SELF == */* ]] || SELF=./$SELF
+HERE=$(cd -P "${SELF%/*}" && pwd -P)
 PLUGIN_ROOT=$(cd -P "$HERE/.." && pwd -P)
 STATEIO="$HERE/stateio.py"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
@@ -21,7 +80,10 @@ STATE_DIR="$STATE_HOME/omarchy/omacursorshake"
 # never match and the mapped-.so ownership proof silently did nothing.
 # One pass only rewrites non-overlapping pairs, so "///" needs the loop.
 while [[ $STATE_DIR == *//* ]]; do STATE_DIR=${STATE_DIR//\/\//\/}; done
-NATIVE_DIR="${OMACURSORSHAKE_NATIVE:-$PLUGIN_ROOT/native}"
+# Fixed, never environment-selected: an inherited variable choosing which
+# tree gets compiled into the compositor is the same hole as an inherited
+# compiler.
+NATIVE_DIR="$PLUGIN_ROOT/native"
 SO_PATH="$STATE_DIR/omacursorshake.so"
 STAMP_PATH="$STATE_DIR/built-for"
 SETTINGS_PATH="$STATE_DIR/settings.json"
@@ -32,7 +94,7 @@ LOADED_IN_PATH="$STATE_DIR/loaded-in"
 # the digests, and cmd_ensure refuses to reuse an .so that was not produced by
 # the current generation. Bump this whenever a change to the build path makes
 # an older artifact no longer trustworthy.
-PIPELINE_VERSION=4
+PIPELINE_VERSION=5
 DIAG_BYTES=2048
 LOG_BUDGET=65536
 IPC_TIMEOUT=5
@@ -42,7 +104,7 @@ MAKE_TIMEOUT=300
 # Strip control characters and keep only the last DIAG_BYTES. tail -c must
 # read its whole input, so this never SIGPIPEs an upstream producer.
 cap_diag() {
-  tr -d '\000-\010\013\014\016-\037\177' | tail -c "$DIAG_BYTES"
+  "$TR_BIN" -d '\000-\010\013\014\016-\037\177' | "$TAIL_BIN" -c "$DIAG_BYTES"
 }
 
 emit_diag() {
@@ -55,8 +117,8 @@ emit_diag() {
 capture_bounded() {
   local max=$1 secs=$2
   shift 2
-  { timeout --signal=TERM --kill-after=3 "$secs" "$@" </dev/null 2>/dev/null || true; } \
-    | head -c "$max"
+  { "$TIMEOUT_BIN" --signal=TERM --kill-after=3 "$secs" "$@" </dev/null 2>/dev/null || true; } \
+    | "$HEAD_BIN" -c "$max"
 }
 
 # hyprctl talks to the compositor over a socket: bound both how long it can
@@ -64,7 +126,7 @@ capture_bounded() {
 hyprctl_capture() {
   local max=$1
   shift
-  capture_bounded "$max" "$IPC_TIMEOUT" hyprctl "$@"
+  capture_bounded "$max" "$IPC_TIMEOUT" "$HYPRCTL_BIN" "$@"
 }
 
 # Run a command under the same runtime cap and forward at most DIAG_BYTES of
@@ -76,7 +138,7 @@ run_diag() {
   local -a codes=()
   [[ $- == *e* ]] && had_e=1
   set +e
-  timeout --signal=TERM --kill-after=3 "$IPC_TIMEOUT" "$@" </dev/null 2>&1 | cap_diag >&2
+  "$TIMEOUT_BIN" --signal=TERM --kill-after=3 "$IPC_TIMEOUT" "$@" </dev/null 2>&1 | cap_diag >&2
   codes=("${PIPESTATUS[@]}")
   (( had_e )) && set -e
   rc=${codes[0]:-1}
@@ -99,9 +161,9 @@ fail_plain() {
 # The message goes out first so a long log tail can never truncate it away.
 fail() {
   emit_diag "omacursorshake: $*"
-  if [[ -n ${BUILD_LOG:-} && -n ${STATEIO:-} ]]; then
+  if [[ -n ${BUILD_LOG:-} && -n ${STATEIO:-} && -n ${PY_BIN:-} ]]; then
     local log_tail=""
-    log_tail=$(python3 "$STATEIO" read-tail "$BUILD_LOG" "$DIAG_BYTES" 2>/dev/null || true)
+    log_tail=$("$PY_BIN" -I "$STATEIO" read-tail "$BUILD_LOG" "$DIAG_BYTES" 2>/dev/null || true)
     if [[ -n $log_tail ]]; then
       emit_diag "omacursorshake: build log tail:"
       emit_diag "$log_tail"
@@ -110,16 +172,48 @@ fail() {
   exit 1
 }
 
-# apply.lua is handed to Hyprland as dofile([==[<path>]==]) and every state
-# path is also passed to git/make. Refuse anything that could close the Lua
-# long bracket or smuggle control characters into the compositor.
-require_base_tools() {
-  local tool
-  for tool in timeout head tr tail jq python3; do
-    command -v "$tool" >/dev/null || fail_plain "$tool is required but was not found in PATH"
-  done
+# Absolute, validated identities for everything we exec. `command -v` used to
+# accept whatever the inherited PATH offered, so a shadowed make, g++, python3
+# or hyprctl ahead of /usr/bin ended up producing -- or loading -- the .so that
+# Hyprland dlopens. Nothing is called by bare name after this point.
+resolve_tools() {
+  local out="" name path
+  out=$("$PY_BIN" -I "$STATEIO" resolve-tools "$TRUSTED_PATH" "$@") \
+    || fail_plain "required tools are missing or untrusted"
+  while IFS=$'\t' read -r name path; do
+    [[ -n $name ]] || continue
+    [[ $name =~ ^[A-Z][A-Z0-9_]*$ ]] || fail_plain "tool resolver returned a bad name"
+    [[ $path == /* ]] || fail_plain "tool resolver returned a relative path for $name"
+    printf -v "$name" '%s' "$path"
+  done <<<"$out"
 }
 
+# python3 is the resolver, so it is found first, with shell builtins only and
+# from the same fixed list. `-I` then keeps every later python out of
+# PYTHONPATH/PYTHONHOME and off the script directory's sys.path.
+require_base_tools() {
+  local d=""
+  for d in "${TRUSTED_BIN_DIRS[@]}"; do
+    if [[ -f $d/python3 && -x $d/python3 ]]; then
+      PY_BIN="$d/python3"
+      break
+    fi
+  done
+  [[ -n $PY_BIN ]] || fail_plain "python3 was not found in $TRUSTED_PATH"
+  [[ -f $STATEIO ]] || fail_plain "stateio.py is missing: $STATEIO"
+  resolve_tools \
+    JQ_BIN=jq TIMEOUT_BIN=timeout HEAD_BIN=head TAIL_BIN=tail TR_BIN=tr \
+    UNAME_BIN=uname ENV_BIN=env HYPRCTL_BIN=hyprctl GSETTINGS_BIN=gsettings?
+}
+
+# Only the build path needs these; a missing compiler must not stop status.
+require_build_tools() {
+  resolve_tools MAKE_BIN=make GXX_BIN=g++ PKGCONFIG_BIN=pkg-config SED_BIN=sed
+}
+
+# apply.lua is handed to Hyprland as dofile([==[<path>]==]) and every state
+# path is also passed to make. Refuse anything that could close the Lua long
+# bracket or smuggle control characters into the compositor.
 require_safe_state_path() {
   local p=${1:-}
   if [[ $p != /* ]]; then
@@ -143,20 +237,20 @@ require_safe_state_path() {
 }
 
 ensure_state_dir() {
-  python3 "$STATEIO" ensure-dir "$STATE_DIR"
+  "$PY_BIN" -I "$STATEIO" ensure-dir "$STATE_DIR"
 }
 
 secure_read() {
-  python3 "$STATEIO" read "$1" "${2:-65536}"
+  "$PY_BIN" -I "$STATEIO" read "$1" "${2:-65536}"
 }
 
 secure_write() {
   local dest=$1 mode=${2:-0600}
-  python3 "$STATEIO" write "$dest" "$mode"
+  "$PY_BIN" -I "$STATEIO" write "$dest" "$mode"
 }
 
 cap_output_ring() {
-  python3 "$STATEIO" write-ring "$1" "$LOG_BUDGET"
+  "$PY_BIN" -I "$STATEIO" write-ring "$1" "$LOG_BUDGET"
 }
 
 # Timeout plus a hard on-disk byte ceiling. The log file never grows past
@@ -174,7 +268,7 @@ run_timed() {
   local tcode=0 capcode=0
   local -a codes=()
   set +e
-  timeout --signal=TERM --kill-after=8 "$secs" "$@" </dev/null 2>&1 \
+  "$TIMEOUT_BIN" --signal=TERM --kill-after=8 "$secs" "$@" </dev/null 2>&1 \
     | cap_output_ring "$BUILD_LOG"
   # Snapshot both stages at once: any command in between, an assignment
   # included, replaces PIPESTATUS.
@@ -199,7 +293,7 @@ run_timed() {
 
 hyprland_field() {
   local raw=""
-  raw=$(hyprctl_capture "$IPC_MAX_BYTES" -j version | jq -r "$1 // empty" 2>/dev/null || true)
+  raw=$(hyprctl_capture "$IPC_MAX_BYTES" -j version | "$JQ_BIN" -r "$1 // empty" 2>/dev/null || true)
   sanitize_field "$raw" "$2"
 }
 
@@ -273,13 +367,13 @@ read_stamp() {
 
 stamp_field() {
   local v=""
-  v=$(jq -r --arg k "$2" '.[$k] // empty | tostring' <<<"$1" 2>/dev/null || true)
+  v=$("$JQ_BIN" -r --arg k "$2" '.[$k] // empty | tostring' <<<"$1" 2>/dev/null || true)
   sanitize_field "${v//$'\n'/}" 128
 }
 
 write_stamp() {
   ensure_state_dir
-  jq -n \
+  "$JQ_BIN" -n \
     --argjson pipeline "$PIPELINE_VERSION" \
     --arg hyprland "$1" \
     --arg sourceDigest "$2" \
@@ -294,7 +388,7 @@ write_stamp() {
 
 so_digest() {
   local d=""
-  d=$(python3 "$STATEIO" file-digest "$SO_PATH" 2>/dev/null || true)
+  d=$("$PY_BIN" -I "$STATEIO" file-digest "$SO_PATH" 2>/dev/null || true)
   sanitize_field "${d//$'\n'/}" 64
 }
 
@@ -335,7 +429,7 @@ hyprland_pid() {
   sig=$(hyprland_instance)
   [[ $sig =~ ^[A-Za-z0-9._-]+$ ]] || return 1
   pid=$(hyprctl_capture "$IPC_MAX_BYTES" -j instances \
-    | jq -r --arg sig "$sig" '
+    | "$JQ_BIN" -r --arg sig "$sig" '
       def entries: if type == "array" then .[] elif type == "object" then . else empty end;
       [entries | select((.instance // "") | tostring == $sig) | (.pid // empty) | tostring]
       | if length == 1 then .[0] else empty end
@@ -351,7 +445,7 @@ hyprland_pid() {
 so_is_mapped() {
   local pid=""
   pid=$(hyprland_pid) || return 1
-  python3 "$STATEIO" maps-has "/proc/${pid}/maps" "$SO_PATH" >/dev/null 2>&1
+  "$PY_BIN" -I "$STATEIO" maps-has "/proc/${pid}/maps" "$SO_PATH" >/dev/null 2>&1
 }
 
 # Three-valued, because the truth is three-valued:
@@ -372,7 +466,7 @@ so_is_mapped() {
 plugin_state() {
   local listed="" inst=""
   listed=$(hyprctl_capture "$IPC_MAX_BYTES" -j plugin list \
-    | jq -r --arg so "$SO_PATH" '
+    | "$JQ_BIN" -r --arg so "$SO_PATH" '
     def entries: if type == "array" then .[] elif type == "object" then . else empty end;
     def pathof: (.path // .filename // "") | tostring;
     def nameof: (.name // .plugin // .handle // "") | tostring;
@@ -420,7 +514,7 @@ plugin_present() {
 # install is the one built from the tree we digested, then published through a
 # same-directory temporary.
 install_so_from() {
-  python3 "$STATEIO" copy-fd "$1" "$2" "$SO_PATH" 0755
+  "$PY_BIN" -I "$STATEIO" copy-fd "$1" "$2" "$SO_PATH" 0755
 }
 
 # QML FileView writes are async; jobs pass a JSON snapshot as $2 so disable
@@ -430,7 +524,7 @@ ingest_settings_json() {
   [[ -n $raw ]] || return 0
   (( ${#raw} <= 65536 )) || fail "settings JSON exceeds 65536 bytes"
   ensure_state_dir
-  jq -e 'type == "object"' <<<"$raw" >/dev/null || fail "settings JSON is invalid"
+  "$JQ_BIN" -e 'type == "object"' <<<"$raw" >/dev/null || fail "settings JSON is invalid"
   printf '%s\n' "$raw" | secure_write "$SETTINGS_PATH"
 }
 
@@ -439,10 +533,10 @@ write_apply_lua() {
   local enabled threshold base timeout raw
   raw=$(secure_read "$SETTINGS_PATH" 65536 || true)
   if [[ -n $raw ]]; then
-    enabled=$(jq -r 'if .enabled == false then "false" else "true" end' <<<"$raw")
-    threshold=$(jq -r '.threshold // 6.0' <<<"$raw")
-    base=$(jq -r '.base // 4.0' <<<"$raw")
-    timeout=$(jq -r '.timeout // 2000' <<<"$raw")
+    enabled=$("$JQ_BIN" -r 'if .enabled == false then "false" else "true" end' <<<"$raw")
+    threshold=$("$JQ_BIN" -r '.threshold // 6.0' <<<"$raw")
+    base=$("$JQ_BIN" -r '.base // 4.0' <<<"$raw")
+    timeout=$("$JQ_BIN" -r '.timeout // 2000' <<<"$raw")
   else
     enabled=true
     threshold=6.0
@@ -465,9 +559,15 @@ write_apply_lua() {
   require_range base "$base" 3 6
   (( timeout >= 1000 && timeout <= 3000 )) || fail "settings.timeout must be 1000-3000 ms"
 
+  # Guard on omacursorshake_api, not omacursorshake: hl.plugin is populated by
+  # addLuaFunction namespaces, not by registered config values, so
+  # hl.plugin.omacursorshake is never present and this whole block used to be
+  # skipped in silence -- every setting fell back to the compiled-in defaults.
+  # ConfigManager.cpp registers that namespace exactly when the plugin loads,
+  # which is the condition this actually wants.
   local lua
   lua=$(cat <<EOF
-if hl.plugin.omacursorshake then
+if hl.plugin.omacursorshake_api then
   hl.config({
     plugin = {
       omacursorshake = {
@@ -493,8 +593,9 @@ EOF
 force_cursor_activate() {
   local theme size
   theme=${HYPRCURSOR_THEME:-${XCURSOR_THEME:-}}
-  if [[ -z $theme || $theme == default ]]; then
-    theme=$(capture_bounded 256 5 gsettings get org.gnome.desktop.interface cursor-theme | tr -d "'")
+  if [[ -z $theme || $theme == default ]] && [[ -n $GSETTINGS_BIN ]]; then
+    theme=$(capture_bounded 256 5 "$GSETTINGS_BIN" get org.gnome.desktop.interface cursor-theme \
+      | "$TR_BIN" -d "'")
   fi
   if [[ -z $theme || $theme == default ]]; then
     theme=Adwaita
@@ -505,19 +606,19 @@ force_cursor_activate() {
   [[ $theme =~ ^[A-Za-z0-9_.][A-Za-z0-9_.\ -]*$ ]] || theme=Adwaita
   size=${HYPRCURSOR_SIZE:-${XCURSOR_SIZE:-24}}
   [[ $size =~ ^[0-9]+$ ]] || size=24
-  run_diag hyprctl setcursor "$theme" "$size" || true
+  run_diag "$HYPRCTL_BIN" setcursor "$theme" "$size" || true
 }
 
 eval_apply() {
   write_apply_lua
-  run_diag hyprctl eval "dofile([==[$APPLY_LUA]==])"
+  run_diag "$HYPRCTL_BIN" eval "dofile([==[$APPLY_LUA]==])"
   force_cursor_activate
 }
 
 cmd_status() {
   ensure_state_dir
   local arch hl_commit hl_ver built loaded so_exists needs src_digest=""
-  arch=$(capture_bounded 64 5 uname -m)
+  arch=$(capture_bounded 64 5 "$UNAME_BIN" -m)
   hl_commit=$(hyprland_commit)
   hl_ver=$(hyprland_version)
   # builtFor reports the Hyprland the current attestation names. A legacy
@@ -526,7 +627,7 @@ cmd_status() {
   built=$(stamp_field "$(read_stamp)" hyprland)
   built=$(sanitize_field "$built" 64)
   so_exists=false
-  python3 "$STATEIO" exists "$SO_PATH" && so_exists=true
+  "$PY_BIN" -I "$STATEIO" exists "$SO_PATH" && so_exists=true
   loaded=false
   # Only a proven-ours plugin counts as loaded. "unknown" is reported as false
   # rather than dressed up as success.
@@ -541,7 +642,7 @@ cmd_status() {
   elif [[ $so_exists != true ]] || ! so_attested_for "$hl_commit" "$src_digest"; then
     needs=true
   fi
-  jq -n \
+  "$JQ_BIN" -n \
     --arg arch "$arch" \
     --argjson supported "$([[ $arch == x86_64 ]] && echo true || echo false)" \
     --arg soPath "$SO_PATH" \
@@ -570,28 +671,25 @@ cmd_status() {
 
 ensure_tree() {
   ensure_state_dir
-  [[ $(capture_bounded 64 5 uname -m) == x86_64 ]] || fail "omacursorshake only works on x86_64 (Hyprland function hooks)"
-  command -v make >/dev/null || fail "make is required to build omacursorshake"
-  command -v g++ >/dev/null || fail "g++ is required to build omacursorshake"
-  command -v timeout >/dev/null || fail "timeout (coreutils) is required to bound make"
-  command -v python3 >/dev/null || fail "python3 is required to cap build-log size"
-  env --chdir=/ true >/dev/null 2>&1 \
+  [[ $(capture_bounded 64 5 "$UNAME_BIN" -m) == x86_64 ]] || fail "omacursorshake only works on x86_64 (Hyprland function hooks)"
+  require_build_tools
+  "$ENV_BIN" --chdir=/ "$UNAME_BIN" >/dev/null 2>&1 \
     || fail "env --chdir (coreutils 8.28+) is required to pin the source tree during the build"
   [[ -r /proc/self/fd ]] || fail "/proc must be mounted to pin the source tree during the build"
-  pkg-config --exists hyprland || fail "pkg-config hyprland is missing; install the hyprland package"
+  "$PKGCONFIG_BIN" --exists hyprland || fail "pkg-config hyprland is missing; install the hyprland package"
   [[ -d $NATIVE_DIR ]] || fail "vendored plugin source is missing: $NATIVE_DIR"
   [[ -f $NATIVE_DIR/Makefile ]] || fail "vendored plugin Makefile is missing: $NATIVE_DIR/Makefile"
 }
 
 native_digest() {
-  python3 "$STATEIO" tree-digest "$NATIVE_DIR"
+  "$PY_BIN" -I "$STATEIO" tree-digest "$NATIVE_DIR"
 }
 
 # Digest the pinned native descriptor. The inode that is hashed is the inode
 # make then compiles and the artifact is copied out of.
 verify_source_tree() {
   local srcfd=$1 got_digest=""
-  got_digest=$(python3 "$STATEIO" tree-digest-fd "$srcfd") \
+  got_digest=$("$PY_BIN" -I "$STATEIO" tree-digest-fd "$srcfd") \
     || fail "could not digest the source tree at $NATIVE_DIR"
   got_digest=$(sanitize_field "${got_digest//$'\n'/}" 64)
   require_sha256 "$got_digest"
@@ -610,7 +708,7 @@ cmd_ensure() {
   require_sha256 "$src_digest"
   plugin_present && was_loaded=true
 
-  if (( force == 0 )) && python3 "$STATEIO" exists "$SO_PATH" \
+  if (( force == 0 )) && "$PY_BIN" -I "$STATEIO" exists "$SO_PATH" \
      && so_attested_for "$hl_commit" "$src_digest"; then
     cmd_status
     return 0
@@ -625,7 +723,16 @@ cmd_ensure() {
   require_sha256 "$verified"
   [[ $verified == "$src_digest" ]] \
     || fail "source tree changed between digest and pin; refusing to build"
-  run_timed "$MAKE_TIMEOUT" env --chdir="$src_pin" make -f Makefile all
+  # env -i: the compiler, pkg-config and sed see only what is listed here, so
+  # an inherited CXX, CXXFLAGS, LDFLAGS, EXTRA_CXXFLAGS, PKG_CONFIG_PATH,
+  # CPATH or LD_PRELOAD cannot reach the artifact Hyprland dlopens. The make
+  # variables are passed on the command line, which outranks both the
+  # environment and the makefile, and -f Makefile pins the file itself.
+  run_timed "$MAKE_TIMEOUT" \
+    "$ENV_BIN" -i --chdir="$src_pin" PATH="$TRUSTED_PATH" LC_ALL=C \
+    "$MAKE_BIN" -f Makefile all \
+    CXX="$GXX_BIN" PKG_CONFIG="$PKGCONFIG_BIN" SED="$SED_BIN" \
+    LDFLAGS= EXTRA_CXXFLAGS= SHELL=/bin/sh
 
   if [[ $was_loaded == true ]]; then
     emit_diag "omacursorshake: plugin is loaded; installing beside the mapped inode"
@@ -642,7 +749,7 @@ cmd_ensure() {
 
 cmd_load() {
   ingest_settings_json "${1:-}"
-  python3 "$STATEIO" exists "$SO_PATH" || fail "plugin is not built yet"
+  "$PY_BIN" -I "$STATEIO" exists "$SO_PATH" || fail "plugin is not built yet"
 
   # About to hand this file to the compositor to dlopen. Existence and
   # ownership say nothing about its content, so re-check the full attestation
@@ -674,7 +781,7 @@ cmd_load() {
 
   if [[ $state == none ]]; then
     local load_rc=0
-    run_diag hyprctl plugin load "$SO_PATH" || load_rc=$?
+    run_diag "$HYPRCTL_BIN" plugin load "$SO_PATH" || load_rc=$?
     # hyprctl's exit status is the only signal that proves *our* load: the
     # listing carries no path on current Hyprland, so a name match cannot
     # distinguish our .so from anyone else's. It is a hard gate, not a hint.
@@ -720,7 +827,7 @@ cmd_apply() {
 
 cmd_save() {
   ingest_settings_json "${1:-}"
-  python3 "$STATEIO" exists "$SETTINGS_PATH" || fail "no settings to save"
+  "$PY_BIN" -I "$STATEIO" exists "$SETTINGS_PATH" || fail "no settings to save"
   cmd_status
 }
 

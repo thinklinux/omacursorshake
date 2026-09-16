@@ -862,11 +862,108 @@ def maps_has(maps_path: str, so_path: str) -> bool:
     return False
 
 
+# --- trusted tool resolution -------------------------------------------------
+#
+# backend.sh used to locate make, g++, python3 and hyprctl with `command -v`,
+# which accepts whatever the inherited PATH happens to offer. A shadowed tool
+# anywhere ahead of /usr/bin ended up producing the .so that Hyprland dlopens.
+# Tools are resolved here instead, against a fixed directory list the caller
+# passes in as an argument -- never read from the environment -- and every
+# candidate must be a regular, executable file that no unprivileged account
+# can rewrite, reached without leaving those directories.
+
+
+def _is_var_name(v: str) -> bool:
+    if not v or not ("A" <= v[0] <= "Z"):
+        return False
+    return all(("A" <= c <= "Z") or ("0" <= c <= "9") or c == "_" for c in v)
+
+
+def trusted_dirs(spec: str) -> list[str]:
+    dirs: list[str] = []
+    for raw in spec.split(":"):
+        if not raw:
+            continue
+        if not raw.startswith("/"):
+            fail(f"trusted tool directory must be absolute: {raw}")
+        try:
+            st = os.stat(raw)
+        except OSError as exc:
+            fail(f"trusted tool directory is unusable: {raw} ({exc.strerror})")
+        if not stat.S_ISDIR(st.st_mode):
+            fail(f"trusted tool directory is not a directory: {raw}")
+        if st.st_uid not in (0, os.geteuid()):
+            fail(f"trusted tool directory is owned by uid {st.st_uid}: {raw}")
+        if st.st_mode & GROUP_OTHER_WRITE and not st.st_mode & stat.S_ISVTX:
+            fail(f"trusted tool directory is group/other writable: {raw}")
+        real = os.path.realpath(raw)
+        if real not in dirs:
+            dirs.append(real)
+    if not dirs:
+        fail("no trusted tool directories were given")
+    return dirs
+
+
+def resolve_tool(name: str, dirs: list[str]) -> tuple[str, str]:
+    """Absolute path of `name` in the first trusted directory that has it."""
+    reason = "not found"
+    for d in dirs:
+        cand = os.path.join(d, name)
+        try:
+            st = os.stat(cand)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            reason = "not a regular file"
+            continue
+        if st.st_uid not in (0, os.geteuid()):
+            reason = f"owned by uid {st.st_uid}"
+            continue
+        if st.st_mode & GROUP_OTHER_WRITE:
+            reason = "group/other writable"
+            continue
+        if not os.access(cand, os.X_OK):
+            reason = "not executable"
+            continue
+        # A symlink inside a trusted directory must not lead out of one:
+        # /usr/bin/python3 -> python3.14 is fine, -> /tmp/shadow is not.
+        real = os.path.realpath(cand)
+        if os.path.dirname(real) not in dirs:
+            reason = f"resolves outside the trusted directories ({real})"
+            continue
+        return cand, ""
+    return "", reason
+
+
+def resolve_tools(dir_spec: str, specs: list[str]) -> int:
+    """Print VAR<TAB>/abs/path for each VAR=tool spec. A trailing `?` is optional."""
+    dirs = trusted_dirs(dir_spec)
+    out: list[str] = []
+    for spec in specs:
+        var, sep, name = spec.partition("=")
+        if not sep or not _is_var_name(var):
+            fail(f"tool spec must be VAR=name: {spec}")
+        optional = name.endswith("?")
+        if optional:
+            name = name[:-1]
+        if not name or "/" in name:
+            fail(f"tool name must be a bare command: {spec}")
+        path, reason = resolve_tool(name, dirs)
+        if not path:
+            if optional:
+                continue
+            fail(f"{name} was not found in {dir_spec} ({reason})")
+        out.append(f"{var}\t{path}\n")
+    sys.stdout.write("".join(out))
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         fail(
             "stateio: usage: ensure-dir|read|read-tail|write|write-ring|copy|copy-fd"
-            "|exists|is-dir|rm-tree|maps-has|tree-digest|tree-digest-fd|file-digest ..."
+            "|exists|is-dir|rm-tree|maps-has|tree-digest|tree-digest-fd|file-digest"
+            "|resolve-tools ..."
         )
     cmd = argv[1]
     if cmd == "ensure-dir":
@@ -941,6 +1038,10 @@ def main(argv: list[str]) -> int:
             remove_tree_in(argv[2], argv[3])
             return 0
         fail("stateio rm-tree <path> | rm-tree <state-dir> <name>")
+    if cmd == "resolve-tools":
+        if len(argv) < 4:
+            fail("stateio resolve-tools <dir:dir:...> <VAR=tool>...")
+        return resolve_tools(argv[2], argv[3:])
     if cmd == "maps-has":
         if len(argv) != 4:
             fail("stateio maps-has <maps-file> <so-path>")

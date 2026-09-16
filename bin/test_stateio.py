@@ -9,6 +9,8 @@ import mmap
 import os
 import re
 import stat
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -294,11 +296,11 @@ def test_remove_depth_bounded(tmp: Path) -> None:
 
 
 def test_backend_refuses_unsafe_state_path(tmp: Path) -> None:
-    env = dict(os.environ)
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp)}
     for bad in (str(tmp / "st]ate"), str(tmp / "st[ate")):
         env["XDG_STATE_HOME"] = bad
         proc = subprocess.run(
-            ["bash", str(BACKEND), "status"],
+            [BASH, "-p", str(BACKEND), "status"],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         assert_true(proc.returncode != 0, f"accepted bracket path {bad}")
@@ -370,46 +372,8 @@ def test_settings_has_one_writer(tmp: Path) -> None:
 PLUGIN_SO = "omacursorshake.so"
 PLUGIN_NAME = "omacursorshake"
 
-STUB_TOOLS = {
-    "uname": "#!/bin/sh\nprintf 'x86_64\\n'\n",
-    "pkg-config": "#!/bin/sh\nexit 0\n",
-    "g++": "#!/bin/sh\nexit 0\n",
-    "hyprctl": (
-        "#!/bin/sh\n"
-        "case \"$*\" in\n"
-        "  *version*) printf '{\"commit\":\"%s\",\"version\":\"0.56.2\"}\\n' "
-        "efb50993780079460b0cbed1363e2166a2de1d9f ;;\n"
-        "  *'plugin list'*) printf '[]\\n' ;;\n"
-        "  *) printf 'ok\\n' ;;\n"
-        "esac\n"
-    ),
-    "make": (
-        "#!/bin/sh\n"
-        "echo \"make $*\" >&2\n"
-        "[ -n \"${STUB_ARGV_LOG:-}\" ] && echo \"make $* cwd=$(pwd -P)\" >> \"$STUB_ARGV_LOG\"\n"
-        "dir=.\n"
-        "while [ $# -gt 0 ]; do\n"
-        "  case \"$1\" in -C) dir=$2; shift 2 ;; *) shift ;; esac\n"
-        "done\n"
-        "${NOISE_CMD:-true}\n"
-        "mkdir -p \"$dir/out\"\n"
-        "printf 'ELF-STUB\\n' > \"$dir/out/omacursorshake.so\"\n"
-        "exit 0\n"
-    ),
-}
-
-
-def stub_path(tmp: Path) -> str:
-    stubs = tmp / "stubs"
-    stubs.mkdir(parents=True, exist_ok=True)
-    for name, body in STUB_TOOLS.items():
-        f = stubs / name
-        f.write_text(body)
-        f.chmod(0o755)
-    return f"{stubs}:{os.environ.get('PATH', '')}"
-
-
 HL_0562 = "efb50993780079460b0cbed1363e2166a2de1d9f"
+BASH = "/usr/bin/bash"
 
 
 def backend_section(name: str) -> str:
@@ -424,12 +388,44 @@ def pipeline_version() -> int | None:
     return int(m.group(1)) if m else None
 
 
-def stub_native(tmp: Path, body: bytes = b"int main(){}\n") -> Path:
-    native = tmp / "native"
+HYPRCTL_STUB = (
+    "#!/bin/sh\n"
+    "case \"$*\" in\n"
+    "  *version*) printf '{\"commit\":\"%s\",\"version\":\"0.56.2\"}\\n' "
+    "efb50993780079460b0cbed1363e2166a2de1d9f ;;\n"
+    "  *'plugin list'*) printf '[]\\n' ;;\n"
+    "  *) printf 'ok\\n' ;;\n"
+    "esac\n"
+)
+
+
+def make_stub(argv_log: Path | None, noise: str) -> str:
+    """`make` now runs under `env -i`, so its knobs are baked in, not inherited."""
+    log = f'echo "make $* cwd=$(pwd -P)" >> {shlex.quote(str(argv_log))}\n' if argv_log else ""
+    return (
+        "#!/bin/sh\n"
+        "echo \"make $*\" >&2\n"
+        + log
+        + "dir=.\n"
+        "while [ $# -gt 0 ]; do\n"
+        "  case \"$1\" in -C) dir=$2; shift 2 ;; *) shift ;; esac\n"
+        "done\n"
+        f"{noise}\n"
+        "mkdir -p \"$dir/out\"\n"
+        "printf 'ELF-STUB\\n' > \"$dir/out/omacursorshake.so\"\n"
+        "exit 0\n"
+    )
+
+
+def stub_native_at(native: Path, body: bytes = b"int main(){}\n") -> Path:
     (native / "src").mkdir(parents=True, exist_ok=True)
     (native / "Makefile").write_text("all:\n\t@true\n")
     (native / "src" / "main.cpp").write_bytes(body)
     return native
+
+
+def stub_native(tmp: Path, body: bytes = b"int main(){}\n") -> Path:
+    return stub_native_at(tmp / "native", body)
 
 
 def tree_digest(path: Path) -> str:
@@ -455,26 +451,93 @@ def seed_attested_so(state: Path, content: bytes = b"ELF-STUB\n", source_digest:
     return so
 
 
-def backend_env(tmp: Path, state: Path, native: Path | None = None) -> dict[str, str]:
-    env = dict(os.environ)
-    env["PATH"] = stub_path(tmp)
-    env["XDG_STATE_HOME"] = str(state)
-    env["OMACURSORSHAKE_NATIVE"] = str(native or stub_native(tmp))
-    return env
+class Fake:
+    """A plugin root whose backend.sh trusts a stub tool directory.
+
+    backend.sh takes neither its tool directories nor its native tree from the
+    environment any more -- inherited PATH and OMACURSORSHAKE_NATIVE were the
+    supply-chain hole -- so there is nothing left to override from out here.
+    The tests patch the TRUSTED_BIN_DIRS constant in a copy of the script and
+    build a real plugin root around it instead, which is also closer to how the
+    thing is actually installed.
+    """
+
+    def __init__(
+        self,
+        tmp: Path,
+        *,
+        hyprctl: str = HYPRCTL_STUB,
+        argv_log: Path | None = None,
+        noise: str = "true",
+        native_body: bytes = b"int main(){}\n",
+        link_native: Path | None = None,
+        state: Path | None = None,
+        extra_stubs: dict[str, str] | None = None,
+        env_extra: dict[str, str] | None = None,
+    ) -> None:
+        tmp.mkdir(parents=True, exist_ok=True)
+        self.tmp = tmp
+        self.stubs = tmp / "stubs"
+        self.stubs.mkdir(parents=True, exist_ok=True)
+        tools = {
+            "uname": "#!/bin/sh\nprintf 'x86_64\\n'\n",
+            "pkg-config": "#!/bin/sh\nexit 0\n",
+            "g++": "#!/bin/sh\nexit 0\n",
+            "hyprctl": hyprctl,
+            "make": make_stub(argv_log, noise),
+        }
+        tools.update(extra_stubs or {})
+        for name, body in tools.items():
+            f = self.stubs / name
+            f.write_text(body)
+            f.chmod(0o755)
+
+        self.root = tmp / "plugin"
+        (self.root / "bin").mkdir(parents=True, exist_ok=True)
+        text = BACKEND.read_text()
+        pinned = "TRUSTED_BIN_DIRS=(/usr/bin /bin)"
+        assert_true(pinned in text, "backend.sh no longer pins its tool directories")
+        self.script = self.root / "bin" / "backend.sh"
+        self.script.write_text(
+            text.replace(pinned, f"TRUSTED_BIN_DIRS=({self.stubs} /usr/bin /bin)", 1)
+        )
+        self.script.chmod(0o755)
+        shutil.copy2(STATEIO, self.root / "bin" / "stateio.py")
+
+        if link_native is not None:
+            (self.root / "native").symlink_to(link_native)
+            self.native = link_native
+        else:
+            self.native = stub_native_at(self.root / "native", native_body)
+
+        self.state = state or (tmp / "state")
+        home = tmp / "home"
+        home.mkdir(exist_ok=True)
+        self.env = {
+            "PATH": f"{self.stubs}:/usr/bin:/bin",
+            "HOME": str(home),
+            "XDG_STATE_HOME": str(self.state),
+        }
+        self.env.update(env_extra or {})
+
+    @property
+    def sdir(self) -> Path:
+        return self.state / "omarchy" / "omacursorshake"
+
+    def run(self, *args: str, timeout: int = 120) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [BASH, "-p", str(self.script), *args],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+        )
 
 
 def test_backend_build_pipeline(tmp: Path) -> None:
     """run_timed must read both pipeline stages; a stale PIPESTATUS broke every build."""
-    state = tmp / "state"
-    native = stub_native(tmp)
-    env = backend_env(tmp, state, native)
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "ensure"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
+    fb = Fake(tmp)
+    proc = fb.run("ensure")
     assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
     assert_true(b"PIPESTATUS" not in proc.stderr, f"PIPESTATUS leak: {proc.stderr!r}")
-    sdir = state / "omarchy" / "omacursorshake"
+    sdir = fb.sdir
     so = sdir / PLUGIN_SO
     assert_true(so.is_file(), "no .so installed")
     assert_true(so.stat().st_mode & 0o777 == 0o755, f"so mode {so.stat().st_mode:o}")
@@ -483,7 +546,7 @@ def test_backend_build_pipeline(tmp: Path) -> None:
     assert_true("pluginRev" not in stamp, f"stamp still names an upstream pin: {stamp}")
     assert_true(stamp["pipeline"] == pipeline_version(), f"stamp pipeline: {stamp}")
     assert_true(
-        stamp["sourceDigest"] == tree_digest(native),
+        stamp["sourceDigest"] == tree_digest(fb.native),
         "stamp does not record the source digest that was verified",
     )
     assert_true(
@@ -495,43 +558,29 @@ def test_backend_build_pipeline(tmp: Path) -> None:
     log = sdir / "build.log"
     assert_true(log.is_file() and log.stat().st_size <= 65536, "build log unbounded")
 
+    # Re-stub make so a second build would leave a trace, then prove it does not.
     argv_log = tmp / "make-reuse.log"
-    env["STUB_ARGV_LOG"] = str(argv_log)
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "ensure"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
+    (fb.stubs / "make").write_text(make_stub(argv_log, "true"))
+    (fb.stubs / "make").chmod(0o755)
+    proc = fb.run("ensure")
     assert_true(proc.returncode == 0, f"reuse ensure failed: {proc.stderr!r}")
     assert_true(not argv_log.exists(), "unchanged native tree was rebuilt")
 
 
 def test_backend_build_log_budget(tmp: Path) -> None:
     """A noisy phase must fail closed and keep build.log inside the budget."""
-    state = tmp / "state"
-    env = backend_env(tmp, state)
-    env["NOISE_CMD"] = "head -c 400000 /dev/zero | tr '\\0' 'n'"
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "ensure"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
+    fb = Fake(tmp, noise="head -c 400000 /dev/zero | tr '\\0' 'n'")
+    proc = fb.run("ensure")
     assert_true(proc.returncode != 0, "noisy build accepted")
     assert_true(b"budget" in proc.stderr, f"err: {proc.stderr!r}")
     # The failure message survives; the log tail must never crowd it out.
     assert_true(b"omacursorshake: output exceeded" in proc.stderr, f"err: {proc.stderr!r}")
-    log = state / "omarchy" / "omacursorshake" / "build.log"
+    log = fb.sdir / "build.log"
     assert_true(log.stat().st_size <= 65536, f"log grew to {log.stat().st_size}")
 
 
-def _hyprctl_stub(tmp: Path, body: str) -> dict[str, str]:
-    tmp.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    env["PATH"] = stub_path(tmp)
-    stub = tmp / "stubs" / "hyprctl"
-    stub.write_text(body)
-    stub.chmod(0o755)
-    env["XDG_STATE_HOME"] = str(tmp / "state")
-    env["OMACURSORSHAKE_NATIVE"] = str(stub_native(tmp))
-    return env
+def _hyprctl_stub(tmp: Path, body: str, **kw) -> Fake:
+    return Fake(tmp, hyprctl=body, **kw)
 
 
 def test_hyprctl_calls_are_time_bounded(tmp: Path) -> None:
@@ -547,12 +596,9 @@ def test_hyprctl_calls_are_time_bounded(tmp: Path) -> None:
         "slow-drip": "#!/bin/sh\nwhile :; do printf x; sleep 0.3; done\n",
     }
     for name, body in cases.items():
-        env = _hyprctl_stub(tmp / name, body)
+        fb = _hyprctl_stub(tmp / name, body)
         start = time.monotonic()
-        proc = subprocess.run(
-            ["bash", str(BACKEND), "status"],
-            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-        )
+        proc = fb.run("status")
         elapsed = time.monotonic() - start
         assert_true(proc.returncode == 0, f"{name}: rc={proc.returncode} {proc.stderr!r}")
         assert_true(elapsed < 60, f"{name}: took {elapsed:.0f}s, not bounded")
@@ -564,7 +610,7 @@ def test_hyprctl_calls_are_time_bounded(tmp: Path) -> None:
         not any("--foreground" in ln for ln in code),
         "--foreground signals only the direct child, so a grandchild defeats the timeout",
     )
-    assert_true("timeout --signal=TERM" in src, "phase timeout missing")
+    assert_true('"$TIMEOUT_BIN" --signal=TERM' in src, "phase timeout missing")
 
 
 def test_hyprctl_output_is_byte_bounded(tmp: Path) -> None:
@@ -577,12 +623,9 @@ def test_hyprctl_output_is_byte_bounded(tmp: Path) -> None:
         "  *) yes '{\"name\":\"flood-omacursorshake\"}' ;;\n"
         "esac\n"
     )
-    env = _hyprctl_stub(tmp / "flood", body)
+    fb = _hyprctl_stub(tmp / "flood", body)
     start = time.monotonic()
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "status"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-    )
+    proc = fb.run("status")
     assert_true(proc.returncode == 0, f"rc={proc.returncode}: {proc.stderr!r}")
     assert_true(time.monotonic() - start < 30, "flood was not cut off promptly")
     assert_true(len(proc.stdout) < 65536, f"status grew to {len(proc.stdout)} bytes")
@@ -615,21 +658,17 @@ def test_gnumakefile_precedence_is_defeated(tmp: Path) -> None:
     assert_true((proj / "ok").exists(), "-f Makefile did not run the intended file")
     assert_true(not (proj / "bad").exists(), "-f Makefile still ran GNUmakefile")
 
-    assert_true("make -f Makefile all" in BACKEND.read_text(), "backend does not pin -f Makefile")
+    src = BACKEND.read_text()
+    assert_true('"$MAKE_BIN" -f Makefile all' in src, "backend does not pin -f Makefile")
+    assert_true('"$ENV_BIN" -i --chdir=' in src, "make no longer runs under env -i")
 
 
 def test_ensure_does_not_invoke_git(tmp: Path) -> None:
     """The vendored tree is compiled in place; git must not run at all."""
-    env = backend_env(tmp, tmp / "state")
-    git = tmp / "stubs" / "git"
-    git.write_text("#!/bin/sh\necho GIT-RAN >&2; exit 1\n")
-    git.chmod(0o755)
     argv_log = tmp / "make-argv.log"
-    env["STUB_ARGV_LOG"] = str(argv_log)
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "ensure"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-    )
+    fb = Fake(tmp, argv_log=argv_log,
+              extra_stubs={"git": "#!/bin/sh\necho GIT-RAN >&2; exit 1\n"})
+    proc = fb.run("ensure")
     assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
     assert_true(b"GIT-RAN" not in proc.stderr, f"git ran: {proc.stderr!r}")
     assert_true("clone" not in BACKEND.read_text(), "backend still clones")
@@ -640,13 +679,8 @@ def test_ensure_does_not_invoke_git(tmp: Path) -> None:
 def test_native_dir_symlink_is_resolved(tmp: Path) -> None:
     """A native tree reached through a symlink must digest the real directory."""
     native = stub_native(tmp)
-    link = tmp / "native-link"
-    link.symlink_to(native)
-    env = backend_env(tmp, tmp / "state", link)
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "ensure"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-    )
+    fb = Fake(tmp, link_native=native)
+    proc = fb.run("ensure")
     assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
     assert_true(b"refusing symlink" not in proc.stderr, proc.stderr.decode())
     status = json.loads(proc.stdout.decode())
@@ -662,11 +696,11 @@ def test_plugin_install_symlink_status(tmp: Path) -> None:
     plug = tmp / "plugins" / "io.github.thinklinux.omacursorshake"
     plug.parent.mkdir(parents=True)
     plug.symlink_to(HERE.parent)
-    env = dict(os.environ)
-    env["PATH"] = stub_path(tmp)
-    env["XDG_STATE_HOME"] = str(tmp / "state")
+    # The shipped script, with its shipped tool directories: this is also the
+    # end-to-end check that /usr/bin alone is enough to run it.
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp), "XDG_STATE_HOME": str(tmp / "state")}
     proc = subprocess.run(
-        ["bash", str(plug / "bin" / "backend.sh"), "status"],
+        [BASH, "-p", str(plug / "bin" / "backend.sh"), "status"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
     )
     assert_true(proc.returncode == 0, f"status failed: {proc.stderr!r}")
@@ -678,7 +712,7 @@ def test_plugin_install_symlink_status(tmp: Path) -> None:
     )
 
 
-def _load_stub(tmp: Path, listed_after: str, load_exit: int) -> dict[str, str]:
+def _load_stub(tmp: Path, listed_after: str, load_exit: int) -> Fake:
     """hyprctl stub whose plugin list changes once a load has been attempted.
 
     That transition is the whole point: the old code re-checked the listing
@@ -695,22 +729,16 @@ def _load_stub(tmp: Path, listed_after: str, load_exit: int) -> dict[str, str]:
         "  *) printf 'ok\\n' ;;\n"
         "esac\n"
     )
-    env = _hyprctl_stub(tmp, body)
-    env["STUB_LOADED"] = str(tmp / "loaded-flag")
-    env["STUB_LISTED_AFTER"] = listed_after
-    native = Path(env["OMACURSORSHAKE_NATIVE"])
-    seed_attested_so(
-        Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake",
-        source_digest=tree_digest(native),
-    )
-    return env
+    fb = _hyprctl_stub(tmp, body, env_extra={
+        "STUB_LOADED": str(tmp / "loaded-flag"),
+        "STUB_LISTED_AFTER": listed_after,
+    })
+    seed_attested_so(fb.sdir, source_digest=tree_digest(fb.native))
+    return fb
 
 
-def _run_load(env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        ["bash", str(BACKEND), "load", '{"enabled":true}'],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-    )
+def _run_load(fb: Fake) -> subprocess.CompletedProcess[bytes]:
+    return fb.run("load", '{"enabled":true}')
 
 
 def test_load_requires_hyprctl_exit_status(tmp: Path) -> None:
@@ -719,9 +747,9 @@ def test_load_requires_hyprctl_exit_status(tmp: Path) -> None:
     Hyprland 0.56 reports no plugin path, so the listing can only ever be a
     name match. It must never stand in for hyprctl's own exit status.
     """
-    env = _load_stub(tmp / "rc", '[{"name":"omacursorshake"}]', load_exit=1)
-    env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
-    proc = _run_load(env)
+    fb = _load_stub(tmp / "rc", '[{"name":"omacursorshake"}]', load_exit=1)
+    fb.env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
+    proc = _run_load(fb)
     assert_true(proc.returncode != 0, "load succeeded despite hyprctl failing")
     assert_true(b"plugin load failed" in proc.stderr, f"err: {proc.stderr!r}")
     assert_true(
@@ -732,13 +760,13 @@ def test_load_requires_hyprctl_exit_status(tmp: Path) -> None:
 
 def test_foreign_plugin_is_not_claimed_as_ours(tmp: Path) -> None:
     """A name match we did not load must not gate, or stand in for, our load."""
-    env = _load_stub(tmp / "foreign", "[]", load_exit=0)
-    env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
+    fb = _load_stub(tmp / "foreign", "[]", load_exit=0)
+    fb.env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
     # Something matching is already loaded before we do anything, and no
     # record of our own load exists for this instance.
-    Path(env["STUB_LOADED"]).touch()
-    env["STUB_LISTED_AFTER"] = '[{"name":"omacursorshake"}]'
-    proc = _run_load(env)
+    Path(fb.env["STUB_LOADED"]).touch()
+    fb.env["STUB_LISTED_AFTER"] = '[{"name":"omacursorshake"}]'
+    proc = _run_load(fb)
     assert_true(proc.returncode != 0, "a foreign plugin was claimed as ours")
     assert_true(b"cannot prove is ours" in proc.stderr, f"err: {proc.stderr!r}")
 
@@ -782,9 +810,9 @@ def test_mapped_so_is_claimed_as_ours(tmp: Path) -> None:
     record can be missing even though our .so is still mapped; that must
     not look like a foreign hyprpm copy.
     """
-    env = _load_stub(tmp, "[]", load_exit=1)
-    env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
-    so = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake" / "omacursorshake.so"
+    fb = _load_stub(tmp, "[]", load_exit=1)
+    fb.env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
+    so = fb.sdir / "omacursorshake.so"
     fd = os.open(so, os.O_RDONLY)
     mapping = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
     load_log = tmp / "hyprctl-load.log"
@@ -799,9 +827,9 @@ def test_mapped_so_is_claimed_as_ours(tmp: Path) -> None:
         "  *) printf 'ok\\n' ;;\n"
         "esac\n"
     )
-    (tmp / "stubs" / "hyprctl").write_text(body)
+    (fb.stubs / "hyprctl").write_text(body)
     try:
-        proc = _run_load(env)
+        proc = _run_load(fb)
     finally:
         mapping.close()
         os.close(fd)
@@ -809,7 +837,7 @@ def test_mapped_so_is_claimed_as_ours(tmp: Path) -> None:
     assert_true(b'"loaded": true' in proc.stdout, f"status: {proc.stdout!r}")
     logged = load_log.read_text() if load_log.exists() else ""
     assert_true("plugin load" not in logged, f"tried to load a second copy: {logged!r}")
-    state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
+    state = fb.sdir
     assert_true(
         (state / "loaded-in").read_text().strip() == "test_instance",
         "maps proof was not recorded for this instance",
@@ -818,25 +846,21 @@ def test_mapped_so_is_claimed_as_ours(tmp: Path) -> None:
 
 def test_confirmed_load_is_recorded_per_instance(tmp: Path) -> None:
     """The happy path still works, and the proof is scoped to one instance."""
-    env = _load_stub(tmp / "ok", '[{"name":"omacursorshake"}]', load_exit=0)
-    env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
-    proc = _run_load(env)
+    fb = _load_stub(tmp / "ok", '[{"name":"omacursorshake"}]', load_exit=0)
+    fb.env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
+    proc = _run_load(fb)
     assert_true(proc.returncode == 0, f"load failed: {proc.stderr!r}")
     assert_true(b'"loaded": true' in proc.stdout, f"status: {proc.stdout!r}")
 
-    state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
     assert_true(
-        (state / "loaded-in").read_text().strip() == "test_instance",
+        (fb.sdir / "loaded-in").read_text().strip() == "test_instance",
         "load was not recorded against the compositor instance",
     )
 
     # A compositor restart changes the signature, so the record stops being
     # evidence and the same listing is no longer proof of our load.
-    env["HYPRLAND_INSTANCE_SIGNATURE"] = "other_instance"
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "status"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-    )
+    fb.env["HYPRLAND_INSTANCE_SIGNATURE"] = "other_instance"
+    proc = fb.run("status")
     assert_true(proc.returncode == 0, f"status failed: {proc.stderr!r}")
     assert_true(
         b'"loaded": false' in proc.stdout,
@@ -855,19 +879,16 @@ def test_cursor_theme_option_injection_refused(tmp: Path) -> None:
         "  *) printf 'ok\\n' ;;\n"
         "esac\n"
     )
-    env = _hyprctl_stub(tmp / "theme", body)
-    env["HYPRCURSOR_THEME"] = "--evil-option"
-    # apply only evals into a plugin it can prove is ours, and the listing
-    # carries no path, so record a load for this instance first. Without it
-    # the run stops at write_apply_lua and never reaches setcursor.
-    env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
-    state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
-    state.mkdir(parents=True, exist_ok=True)
-    (state / "loaded-in").write_text("test_instance\n")
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "apply", '{"enabled":true}'],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-    )
+    fb = _hyprctl_stub(tmp / "theme", body, env_extra={
+        "HYPRCURSOR_THEME": "--evil-option",
+        # apply only evals into a plugin it can prove is ours, and the listing
+        # carries no path, so record a load for this instance first. Without it
+        # the run stops at write_apply_lua and never reaches setcursor.
+        "HYPRLAND_INSTANCE_SIGNATURE": "test_instance",
+    })
+    fb.sdir.mkdir(parents=True, exist_ok=True)
+    (fb.sdir / "loaded-in").write_text("test_instance\n")
+    proc = fb.run("apply", '{"enabled":true}')
     assert_true(proc.returncode == 0, f"apply failed: {proc.stderr!r}")
     logged = argv_log.read_text()
     assert_true("setcursor Adwaita" in logged, f"theme not sanitised: {logged!r}")
@@ -950,29 +971,22 @@ def test_tree_digest_refuses_links_and_specials(tmp: Path) -> None:
 
 def test_native_change_forces_rebuild(tmp: Path) -> None:
     """A later edit to the vendored tree must not reuse the previous .so."""
-    native = stub_native(tmp, b"// version one\n")
-    env = backend_env(tmp, tmp / "state", native)
     argv_log = tmp / "make-1.log"
-    env["STUB_ARGV_LOG"] = str(argv_log)
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "ensure"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-    )
+    fb = Fake(tmp, native_body=b"// version one\n", argv_log=argv_log)
+    proc = fb.run("ensure")
     assert_true(proc.returncode == 0, f"first ensure failed: {proc.stderr!r}")
-    first = json.loads((tmp / "state" / "omarchy" / "omacursorshake" / "built-for").read_text())
+    first = json.loads((fb.sdir / "built-for").read_text())
 
-    (native / "src" / "main.cpp").write_bytes(b"// version two\n")
+    (fb.native / "src" / "main.cpp").write_bytes(b"// version two\n")
     argv_log2 = tmp / "make-2.log"
-    env["STUB_ARGV_LOG"] = str(argv_log2)
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "ensure"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-    )
+    (fb.stubs / "make").write_text(make_stub(argv_log2, "true"))
+    (fb.stubs / "make").chmod(0o755)
+    proc = fb.run("ensure")
     assert_true(proc.returncode == 0, f"rebuild failed: {proc.stderr!r}")
     assert_true(argv_log2.exists(), "changed source was reused without make")
-    second = json.loads((tmp / "state" / "omarchy" / "omacursorshake" / "built-for").read_text())
+    second = json.loads((fb.sdir / "built-for").read_text())
     assert_true(second["sourceDigest"] != first["sourceDigest"], "digest did not move")
-    assert_true(second["sourceDigest"] == tree_digest(native), "stamp is not the new tree")
+    assert_true(second["sourceDigest"] == tree_digest(fb.native), "stamp is not the new tree")
 
 
 def test_backend_has_no_remote_fetch() -> None:
@@ -983,7 +997,11 @@ def test_backend_has_no_remote_fetch() -> None:
     assert_true("plugin_rev_for" not in src, "upstream pin table is back")
     assert_true("tree-digest-fd" in backend_section("verify_source_tree"),
                 "verify_source_tree does not digest the pinned native tree")
-    assert_true("OMACURSORSHAKE_NATIVE" in src, "native tree is not overridable for tests")
+    # The reverse of what this used to assert. An environment variable naming
+    # the tree that gets compiled into the compositor is the same hole as an
+    # inherited compiler, so the tests patch a copy of the script instead.
+    assert_true("OMACURSORSHAKE_NATIVE" not in src, "native tree is environment-selectable again")
+    assert_true('NATIVE_DIR="$PLUGIN_ROOT/native"' in src, "native tree is not pinned to the plugin root")
 
 
 def test_legacy_stamp_forces_a_rebuild(tmp: Path) -> None:
@@ -993,20 +1011,15 @@ def test_legacy_stamp_forces_a_rebuild(tmp: Path) -> None:
     built without any source verification in place and cmd_ensure short-
     circuited straight past it. The stamp now names the pipeline generation.
     """
-    state = tmp / "state"
-    sdir = state / "omarchy" / "omacursorshake"
+    argv_log = tmp / "make-ran.log"
+    fb = Fake(tmp, argv_log=argv_log)
+    sdir = fb.sdir
     sdir.mkdir(parents=True)
     (sdir / "omacursorshake.so").write_bytes(b"OLD-UNVERIFIED-ARTIFACT\n")
     # Exactly what the old code wrote: the Hyprland commit, nothing else.
     (sdir / "built-for").write_text(HL_0562 + "\n")
 
-    env = backend_env(tmp, state)
-    argv_log = tmp / "make-ran.log"
-    env["STUB_ARGV_LOG"] = str(argv_log)
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "ensure"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-    )
+    proc = fb.run("ensure")
     assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
     assert_true(argv_log.exists(), "legacy stamp was accepted; the old .so was never rebuilt")
     assert_true(
@@ -1028,23 +1041,23 @@ def test_attestation_mismatch_blocks_reuse_and_load(tmp: Path) -> None:
         # so the attestation is the only thing that can refuse it. With "[]"
         # a backend without the gate stops later on "no matching plugin is
         # listed", which would prove nothing about the gate.
-        env = _load_stub(
+        fb = _load_stub(
             tmp / label.replace(" ", "-"),
             '[{"name":"omacursorshake"}]',
             load_exit=0,
         )
-        env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
-        state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
+        fb.env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
+        state = fb.sdir
         if content is not None:
             # Stamp stays valid; only the file it attests changes.
             (state / "omacursorshake.so").write_bytes(content)
         else:
             seed_attested_so(
                 state,
-                source_digest=tree_digest(Path(env["OMACURSORSHAKE_NATIVE"])),
+                source_digest=tree_digest(fb.native),
                 **override,
             )
-        proc = _run_load(env)
+        proc = _run_load(fb)
         assert_true(proc.returncode != 0, f"{label}: load was allowed")
         assert_true(
             b"build attestation" in proc.stderr,
@@ -1057,21 +1070,20 @@ def test_attestation_mismatch_blocks_reuse_and_load(tmp: Path) -> None:
 
 def test_substring_path_is_not_claimed_as_ours(tmp: Path) -> None:
     """A listed path that merely contains ours is a different binary."""
-    env = _load_stub(tmp / "substr", "[]", load_exit=0)
-    state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
-    ours = str(state / "omacursorshake.so")
-    Path(env["STUB_LOADED"]).touch()
+    fb = _load_stub(tmp / "substr", "[]", load_exit=0)
+    ours = str(fb.sdir / "omacursorshake.so")
+    Path(fb.env["STUB_LOADED"]).touch()
     for decoy in (ours + ".bak", "/opt/vendor" + ours):
-        env["STUB_LISTED_AFTER"] = json.dumps([{"name": "omacursorshake", "path": decoy}])
-        proc = _run_load(env)
+        fb.env["STUB_LISTED_AFTER"] = json.dumps([{"name": "omacursorshake", "path": decoy}])
+        proc = _run_load(fb)
         assert_true(proc.returncode != 0, f"{decoy} was claimed as ours")
         assert_true(b"cannot prove is ours" in proc.stderr, f"err: {proc.stderr!r}")
 
 
 def test_settings_ranges_are_enforced(tmp: Path) -> None:
     """Shape is not range: a hand-edited settings.json must not reach hl.config()."""
-    env = _load_stub(tmp / "ranges", "[]", load_exit=0)
-    state = Path(env["XDG_STATE_HOME"]) / "omarchy" / "omacursorshake"
+    fb = _load_stub(tmp / "ranges", "[]", load_exit=0)
+    state = fb.sdir
     for payload, field in (
         ('{"enabled":true,"base":999}', b"base"),
         ('{"enabled":true,"base":0}', b"base"),
@@ -1079,10 +1091,7 @@ def test_settings_ranges_are_enforced(tmp: Path) -> None:
         ('{"enabled":true,"threshold":999.999}', b"threshold"),
         ('{"enabled":true,"timeout":60000}', b"timeout"),
     ):
-        proc = subprocess.run(
-            ["bash", str(BACKEND), "apply", payload],
-            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-        )
+        proc = fb.run("apply", payload)
         assert_true(proc.returncode != 0, f"{payload} was accepted")
         assert_true(field in proc.stderr, f"{payload}: wrong error {proc.stderr!r}")
         assert_true(
@@ -1090,10 +1099,7 @@ def test_settings_ranges_are_enforced(tmp: Path) -> None:
             f"{payload} reached apply.lua",
         )
     # The values the sliders actually produce must still pass.
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "apply", '{"enabled":true,"threshold":8,"base":3,"timeout":3000}'],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-    )
+    proc = fb.run("apply", '{"enabled":true,"threshold":8,"base":3,"timeout":3000}')
     assert_true(proc.returncode == 0, f"in-range settings refused: {proc.stderr!r}")
     assert_true((state / "apply.lua").is_file(), "apply.lua not written for valid settings")
 
@@ -1108,7 +1114,7 @@ def test_source_tree_is_pinned_by_descriptor(tmp: Path) -> None:
     assert_true("exec {srcfd}<" in body, "source tree is not pinned by descriptor")
     assert_true("tree-digest-fd" in backend_section("verify_source_tree"),
                 "digest does not use the pinned descriptor")
-    assert_true("env --chdir=" in body, "make is not run through the pinned descriptor")
+    assert_true('--chdir="$src_pin"' in body, "make is not run through the pinned descriptor")
     assert_true(
         'make -C "$NATIVE_DIR"' not in BACKEND.read_text(),
         "a build step still re-resolves $NATIVE_DIR by name",
@@ -1125,10 +1131,10 @@ def test_source_tree_is_pinned_by_descriptor(tmp: Path) -> None:
     dest.parent.mkdir(parents=True)
     script = (
         'exec {fd}<"$1"; mv "$1" "$1.gone"; mv "$4" "$1"; '
-        'exec python3 "$2" copy-fd $fd out/omacursorshake.so "$3" 0755'
+        'exec /usr/bin/python3 -I "$2" copy-fd $fd out/omacursorshake.so "$3" 0755'
     )
     subprocess.run(
-        ["bash", "-c", script, "_", str(real), str(STATEIO), str(dest), str(evil)],
+        [BASH, "-c", script, "_", str(real), str(STATEIO), str(dest), str(evil)],
         check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
     )
     assert_true(
@@ -1146,13 +1152,10 @@ def test_state_path_is_normalized(tmp: Path) -> None:
     is always canonical, so that comparison could never match and the
     mapped-.so ownership proof silently did nothing.
     """
-    state = tmp / "state"
-    env = backend_env(tmp, state)
-    env["XDG_STATE_HOME"] = str(state) + "/"
-    proc = subprocess.run(
-        ["bash", str(BACKEND), "status"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-    )
+    fb = Fake(tmp)
+    state = fb.state
+    fb.env["XDG_STATE_HOME"] = str(state) + "/"
+    proc = fb.run("status")
     assert_true(proc.returncode == 0, f"status failed: {proc.stderr!r}")
     status = json.loads(proc.stdout.decode())
     for key in ("soPath", "settingsPath"):
@@ -1166,14 +1169,170 @@ def test_state_path_is_normalized(tmp: Path) -> None:
     # The same must hold for a separator doubled in the middle, and for "///",
     # which a single non-overlapping pass would leave as "//".
     for suffix in ("//", "///"):
-        env["XDG_STATE_HOME"] = str(state) + suffix
-        proc = subprocess.run(
-            ["bash", str(BACKEND), "status"],
-            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-        )
+        fb.env["XDG_STATE_HOME"] = str(state) + suffix
+        proc = fb.run("status")
         assert_true(proc.returncode == 0, f"status failed for {suffix!r}: {proc.stderr!r}")
         got = json.loads(proc.stdout.decode())["soPath"]
         assert_true("//" not in got, f"{suffix!r} left a doubled separator: {got}")
+
+
+def test_toolchain_is_pinned_not_searched() -> None:
+    """The shipped script must not take a tool, or a tool path, from anywhere."""
+    src = BACKEND.read_text()
+    code = [ln for ln in src.splitlines() if not ln.strip().startswith("#")]
+    assert_true("TRUSTED_BIN_DIRS=(/usr/bin /bin)" in src, "tool directories are not pinned")
+    assert_true(any('export PATH="$TRUSTED_PATH"' in ln for ln in code),
+                "PATH is not replaced with the trusted list")
+    assert_true(not any("command -v" in ln for ln in code),
+                "a tool is still located by PATH search")
+    assert_true(not any("$(dirname" in ln for ln in code),
+                "dirname runs before the tool preflight has vouched for it")
+    # Every external call goes through a resolved *_BIN variable. Quoted text is
+    # stripped first, so a diagnostic that merely names a tool does not count.
+    stripped = [re.sub(r"\"[^\"]*\"|'[^']*'", "", ln) for ln in code]
+    bare = re.compile(r"(?:^|\||\$\(|;|&&)\s*(jq|make|g\+\+|pkg-config|hyprctl|python3)\b(?!=)")
+    for ln in stripped:
+        assert_true(not bare.search(ln), f"a tool is still executed by bare name: {ln!r}")
+    assert_true("unset BASH_ENV ENV" in src, "loader and interpreter variables are not scrubbed")
+
+    qml = (HERE.parent / "Service.qml").read_text()
+    assert_true('"/usr/bin/bash"' in qml and '"/usr/bin/python3"' in qml,
+                "Service.qml does not use absolute interpreters")
+    assert_true('"bash"' not in qml and '"python3"' not in qml,
+                "Service.qml still spawns a PATH-resolved interpreter")
+    assert_true(qml.count("clearEnvironment: true") == 5,
+                "not every spawn clears the inherited environment")
+
+
+def test_shadowed_tools_are_not_used(tmp: Path) -> None:
+    """A hostile PATH must not decide which binaries the backend runs.
+
+    This is the reported supply-chain finding: whatever the compositor's shell
+    inherited used to pick `bash`, `python3`, `jq`, `make` and `hyprctl`, and
+    the result is compiled into a .so that Hyprland dlopens.
+    """
+    shadow = tmp / "shadow"
+    shadow.mkdir()
+    marker = tmp / "SHADOW-RAN"
+    for name in ("python3", "jq", "hyprctl", "uname", "timeout", "head", "tail",
+                 "tr", "make", "g++", "pkg-config", "sed", "env"):
+        f = shadow / name
+        f.write_text(f"#!/bin/sh\necho {name} >> {shlex.quote(str(marker))}\nexit 0\n")
+        f.chmod(0o755)
+
+    # The real, shipped script -- no patched tool directories.
+    proc = subprocess.run(
+        [BASH, "-p", str(BACKEND), "status"],
+        env={"PATH": f"{shadow}:/usr/bin:/bin", "HOME": str(tmp),
+             "XDG_STATE_HOME": str(tmp / "state")},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    assert_true(proc.returncode == 0, f"status failed: {proc.stderr!r}")
+    assert_true(not marker.exists(),
+                f"a shadowed tool ran: {marker.read_text() if marker.exists() else ''!r}")
+    # And it really did the work, rather than failing early and touching nothing.
+    assert_true(len(json.loads(proc.stdout.decode())["soPath"]) > 0, "no status produced")
+
+
+def test_build_environment_is_scrubbed(tmp: Path) -> None:
+    """An inherited compiler variable must not reach make, the compiler or pkg-config."""
+    env_log = tmp / "make-env.log"
+    dump = f'env > {shlex.quote(str(env_log))}\n'
+    argv_log = tmp / "make-argv.log"
+    fb = Fake(tmp, argv_log=argv_log)
+    (fb.stubs / "make").write_text(
+        make_stub(argv_log, "true").replace("dir=.\n", dump + "dir=.\n")
+    )
+    (fb.stubs / "make").chmod(0o755)
+
+    poison = {
+        "LDFLAGS": "-Wl,--just-symbols=/tmp/evil.so",
+        "EXTRA_CXXFLAGS": "-include /tmp/evil.h",
+        "CXXFLAGS": "-DEVIL=1",
+        "CXX": "/tmp/shadow-g++",
+        "CC": "/tmp/shadow-cc",
+        "PKG_CONFIG_PATH": "/tmp/evil-pc",
+        "PKG_CONFIG_SYSROOT_DIR": "/tmp/evil-root",
+        "CPATH": "/tmp/evil-include",
+        "C_INCLUDE_PATH": "/tmp/evil-include",
+        "CPLUS_INCLUDE_PATH": "/tmp/evil-include",
+        "LIBRARY_PATH": "/tmp/evil-lib",
+        "LD_PRELOAD": "/tmp/evil.so",
+        "LD_LIBRARY_PATH": "/tmp/evil-lib",
+        "GCC_EXEC_PREFIX": "/tmp/evil-gcc/",
+        "COMPILER_PATH": "/tmp/evil-gcc",
+        "MAKEFLAGS": "-e",
+        "GNUMAKEFLAGS": "-e",
+        "MAKEFILES": "/tmp/evil.mk",
+        "PYTHONPATH": "/tmp/evil-py",
+        "BASH_ENV": "/tmp/evil.sh",
+    }
+    fb.env.update(poison)
+    proc = fb.run("ensure")
+    assert_true(proc.returncode == 0, f"ensure failed: {proc.stderr!r}")
+
+    seen = dict(
+        line.split("=", 1) for line in env_log.read_text().splitlines() if "=" in line
+    )
+    for name in poison:
+        assert_true(name not in seen, f"{name} reached the build: {seen.get(name)!r}")
+    assert_true(seen.get("PATH", "").endswith("/usr/bin:/bin"),
+                f"build PATH is not the trusted list: {seen.get('PATH')!r}")
+    # make itself must be told which toolchain to use, on the command line,
+    # where it outranks both the environment and the makefile.
+    assert_true(argv_log.exists(), f"make was not invoked: {proc.stderr!r}")
+    argv = argv_log.read_text()
+    for expected in ("-f Makefile", "CXX=/", "PKG_CONFIG=/", "SED=/", "LDFLAGS=", "EXTRA_CXXFLAGS="):
+        assert_true(expected in argv, f"make was not given {expected}: {argv!r}")
+
+
+def test_makefile_keeps_no_gnu_unique_with_an_absolute_cxx(tmp: Path) -> None:
+    """CXX now arrives as a path, and a bare `g++` comparison would miss it.
+
+    Losing --no-gnu-unique is silent: the .so still builds, and then dangles on
+    STB_GNU_UNIQUE symbols the next time Hyprland reloads it.
+    """
+    proj = tmp / "proj"
+    (proj / "src").mkdir(parents=True)
+    shutil.copy2(HERE.parent / "native" / "Makefile", proj / "Makefile")
+    (proj / "src" / "x.cpp").write_text("int main(){}\n")
+    proc = subprocess.run(
+        ["/usr/bin/make", "-f", "Makefile", "--just-print", "all",
+         "CXX=/usr/bin/g++", "PKG_CONFIG=/usr/bin/true", "SED=/usr/bin/cat"],
+        cwd=proj, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+    )
+    assert_true(proc.returncode == 0, f"makefile dry run failed: {proc.stderr!r}")
+    out = proc.stdout.decode()
+    assert_true("/usr/bin/g++" in out, f"absolute CXX was not used: {out!r}")
+    assert_true("--no-gnu-unique" in out,
+                f"--no-gnu-unique was dropped for an absolute CXX: {out!r}")
+
+
+def test_apply_lua_guards_on_a_table_hl_plugin_has(tmp: Path) -> None:
+    """The guard must name a namespace Hyprland actually puts in hl.plugin.
+
+    hl.plugin is populated by addLuaFunction namespaces, not by registered
+    config values, so `if hl.plugin.omacursorshake` was never true: apply.lua
+    ran, returned ok, and silently applied nothing. Every setting the user
+    picked fell back to the compiled-in default.
+    """
+    cm = (HERE.parent / "native" / "src" / "config" / "ConfigManager.cpp").read_text()
+    m = re.search(r'addLuaFunction\(PHANDLE,\s*"([A-Za-z0-9_]+)"', cm)
+    assert_true(m is not None, "the plugin registers no Lua namespace at all")
+    ns = m.group(1)
+    body = backend_section("write_apply_lua")
+    assert_true(f"hl.plugin.{ns} then" in body,
+                f"apply.lua guards on a table hl.plugin never holds; want hl.plugin.{ns}")
+
+    # And the settings still have to reach the config paths the plugin registers.
+    fb = _load_stub(tmp / "lua", "[]", load_exit=0)
+    fb.env["HYPRLAND_INSTANCE_SIGNATURE"] = "test_instance"
+    (fb.sdir / "loaded-in").write_text("test_instance\n")
+    proc = fb.run("apply", '{"enabled":true,"threshold":8,"base":3,"timeout":3000}')
+    assert_true(proc.returncode == 0, f"apply failed: {proc.stderr!r}")
+    lua = (fb.sdir / "apply.lua").read_text()
+    for expected in ("threshold = 8", "base = 3", "timeout = 3000", f"hl.plugin.{ns}"):
+        assert_true(expected in lua, f"apply.lua missing {expected!r}: {lua!r}")
 
 
 def test_watchdog_and_installer_guards() -> None:
@@ -1227,13 +1386,19 @@ def main() -> int:
         test_source_tree_is_pinned_by_descriptor,
         test_state_path_is_normalized,
         test_watchdog_and_installer_guards,
+        test_apply_lua_guards_on_a_table_hl_plugin_has,
+        test_toolchain_is_pinned_not_searched,
+        test_shadowed_tools_are_not_used,
+        test_build_environment_is_scrubbed,
+        test_makefile_keeps_no_gnu_unique_with_an_absolute_cxx,
     ]
     failed = 0
     for test in tests:
         tmp = Path(tempfile.mkdtemp(prefix="stateio-test-"))
         try:
             if test in (test_source_never_reopens_full_path, test_watchdog_and_installer_guards,
-                        test_backend_has_no_remote_fetch):
+                        test_backend_has_no_remote_fetch,
+                        test_toolchain_is_pinned_not_searched):
                 test()
             else:
                 test(tmp)

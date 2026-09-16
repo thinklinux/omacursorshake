@@ -248,7 +248,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         throw std::runtime_error("hooks failed for unknown reason");
     }
 
-    return {"omacursorshake", "shake the mouse to enlarge the cursor", "Virt / Tihomir Valkanov", "1.1.2"};
+    return {"omacursorshake", "shake the mouse to enlarge the cursor", "Virt / Tihomir Valkanov", "1.1.3"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
