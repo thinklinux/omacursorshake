@@ -57,9 +57,13 @@ you want it gone.
 
 - x86_64 only (Hyprland function hooks)
 - A Hyprland update rebuilds the compositor plugin on next login (stamp
-  mismatch), as does any change to the vendored `native/` tree, the
-  build-pipeline generation, or the installed binary's own bytes. Do not
-  overwrite the mapped `.so` while Hyprland has it loaded.
+  mismatch). The stamp tracks the plugin ABI Hyprland actually checks: the
+  git commit plus the library versions. A library bump such as Aquamarine
+  0.14 to 0.15 changes that string while the commit stays the same, and the
+  old `.so` is rebuilt instead of being rejected as a version mismatch. A
+  change to the vendored `native/` tree, the build-pipeline generation, or
+  the installed binary's own bytes does the same. Do not overwrite the
+  mapped `.so` while Hyprland has it loaded.
 - Building needs `/proc` mounted and coreutils 8.28+ (`env --chdir`), which is
   how the source tree is pinned by descriptor across the build.
 - Sensitivity, magnification, and hold are range-checked backend-side against

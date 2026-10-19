@@ -94,7 +94,10 @@ LOADED_IN_PATH="$STATE_DIR/loaded-in"
 # the digests, and cmd_ensure refuses to reuse an .so that was not produced by
 # the current generation. Bump this whenever a change to the build path makes
 # an older artifact no longer trustworthy.
-PIPELINE_VERSION=5
+# 6: the stamp records Hyprland's plugin ABI (commit plus library versions).
+# A commit-only stamp reused an .so after a library bump, and PLUGIN_INIT
+# then failed with "version mismatch".
+PIPELINE_VERSION=6
 DIAG_BYTES=2048
 LOG_BUDGET=65536
 IPC_TIMEOUT=5
@@ -305,6 +308,20 @@ hyprland_version() {
   hyprland_field .version 128
 }
 
+# Hyprland rejects a plugin whose compiled ABI differs from the running
+# compositor. The string is the git commit plus the library versions
+# (aquamarine, hyprutils, hyprgraphics, hyprcursor, hyprlang). A package
+# update can change one of those libraries and leave .commit untouched.
+# Stamping only the commit then reused an .so that PLUGIN_INIT refused
+# with "version mismatch".
+hyprland_abi() {
+  local raw=""
+  raw=$(hyprland_field .abiHash 160)
+  if [[ $raw =~ ^[0-9a-f]{40}(_[A-Za-z0-9.]+){1,12}$ ]]; then
+    printf '%s' "$raw"
+  fi
+}
+
 # Identity of the running compositor instance. A recorded load is evidence
 # only for the instance it happened in: a Hyprland restart drops every loaded
 # plugin, and the signature changes with it, so a stale record stops matching
@@ -354,11 +371,11 @@ require_sha256() {
 # --- build attestation stamp -------------------------------------------------
 #
 # The stamp is a JSON record of what produced the installed .so, not merely
-# which Hyprland it was built for. A bare Hyprland SHA let an artifact built by
-# an older, weaker pipeline survive an upgrade untouched: the short-circuit in
-# cmd_ensure matched, no rebuild happened, and the digest attestation this
-# plugin is built around never applied to it. Every field must match, and the
-# file on disk must still hash to the recorded digest, before the .so is
+# which Hyprland commit it was built for. A bare commit let an artifact built
+# against an older library ABI survive an upgrade untouched: the short-circuit
+# in cmd_ensure matched, no rebuild happened, and the compositor rejected the
+# .so as a version mismatch. Every field must match, including that ABI, and
+# the file on disk must still hash to the recorded digest, before the .so is
 # reused or handed to the compositor.
 
 read_stamp() {
@@ -366,9 +383,9 @@ read_stamp() {
 }
 
 stamp_field() {
-  local v=""
+  local v="" limit=${3:-128}
   v=$("$JQ_BIN" -r --arg k "$2" '.[$k] // empty | tostring' <<<"$1" 2>/dev/null || true)
-  sanitize_field "${v//$'\n'/}" 128
+  sanitize_field "${v//$'\n'/}" "$limit"
 }
 
 write_stamp() {
@@ -378,9 +395,11 @@ write_stamp() {
     --arg hyprland "$1" \
     --arg sourceDigest "$2" \
     --arg soDigest "$3" \
+    --arg abi "$4" \
     '{
       pipeline: $pipeline,
       hyprland: $hyprland,
+      abi: $abi,
       sourceDigest: $sourceDigest,
       soDigest: $soDigest
     }' | secure_write "$STAMP_PATH"
@@ -393,16 +412,17 @@ so_digest() {
 }
 
 # True only when the installed .so is the artifact this pipeline generation
-# built, from the native tree whose digest we attested, for this Hyprland --
-# and the bytes on disk still hash to it. A legacy stamp has no fields and
+# built, from the native tree whose digest we attested, for this Hyprland ABI
+# -- and the bytes on disk still hash to it. A legacy stamp has no fields and
 # fails here, forcing a rebuild.
 so_attested_for() {
-  local hl=$1 want_src=$2 raw="" recorded=""
-  [[ -n $hl && -n $want_src ]] || return 1
+  local hl=$1 want_src=$2 abi=$3 raw="" recorded=""
+  [[ -n $hl && -n $want_src && -n $abi ]] || return 1
   raw=$(read_stamp)
   [[ -n $raw ]] || return 1
   [[ $(stamp_field "$raw" pipeline) == "$PIPELINE_VERSION" ]] || return 1
   [[ $(stamp_field "$raw" hyprland) == "$hl" ]] || return 1
+  [[ $(stamp_field "$raw" abi 160) == "$abi" ]] || return 1
   [[ $(stamp_field "$raw" sourceDigest) == "$want_src" ]] || return 1
   recorded=$(stamp_field "$raw" soDigest)
   [[ $recorded =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -617,10 +637,11 @@ eval_apply() {
 
 cmd_status() {
   ensure_state_dir
-  local arch hl_commit hl_ver built loaded so_exists needs src_digest=""
+  local arch hl_commit hl_ver hl_abi built loaded so_exists needs src_digest=""
   arch=$(capture_bounded 64 5 "$UNAME_BIN" -m)
   hl_commit=$(hyprland_commit)
   hl_ver=$(hyprland_version)
+  hl_abi=$(hyprland_abi)
   # builtFor reports the Hyprland the current attestation names. A legacy
   # plain-SHA stamp has no such field and reads empty, which is accurate:
   # nothing about that artifact is attested any more.
@@ -639,7 +660,7 @@ cmd_status() {
   needs=false
   if [[ $arch != x86_64 ]]; then
     needs=false
-  elif [[ $so_exists != true ]] || ! so_attested_for "$hl_commit" "$src_digest"; then
+  elif [[ $so_exists != true ]] || ! so_attested_for "$hl_commit" "$src_digest" "$hl_abi"; then
     needs=true
   fi
   "$JQ_BIN" -n \
@@ -700,21 +721,22 @@ cmd_ensure() {
   local force=${1:-0}
   ensure_tree
   require_safe_state_path "$NATIVE_DIR"
-  local hl_commit was_loaded=false src_digest=""
+  local hl_commit hl_abi was_loaded=false src_digest=""
   hl_commit=$(hyprland_commit)
-  [[ -n $hl_commit ]] || fail "could not read Hyprland version (is hyprctl available?)"
+  hl_abi=$(hyprland_abi)
+  [[ -n $hl_commit && -n $hl_abi ]] || fail "could not read Hyprland version (is hyprctl available?)"
   src_digest=$(native_digest)
   src_digest=$(sanitize_field "${src_digest//$'\n'/}" 64)
   require_sha256 "$src_digest"
   plugin_present && was_loaded=true
 
   if (( force == 0 )) && "$PY_BIN" -I "$STATEIO" exists "$SO_PATH" \
-     && so_attested_for "$hl_commit" "$src_digest"; then
+     && so_attested_for "$hl_commit" "$src_digest" "$hl_abi"; then
     cmd_status
     return 0
   fi
 
-  emit_diag "omacursorshake: building vendored plugin for Hyprland $hl_commit"
+  emit_diag "omacursorshake: building vendored plugin for Hyprland $hl_abi"
 
   local srcfd="" src_pin="" verified=""
   exec {srcfd}<"$NATIVE_DIR" || fail "could not pin the source tree at $NATIVE_DIR"
@@ -743,7 +765,7 @@ cmd_ensure() {
   require_sha256 "$so_sha"
   exec {srcfd}<&-
 
-  write_stamp "$hl_commit" "$verified" "$so_sha"
+  write_stamp "$hl_commit" "$verified" "$so_sha" "$hl_abi"
   cmd_status
 }
 
@@ -762,11 +784,13 @@ cmd_load() {
   # check and a same-uid process could swap the file in between. That is not a
   # boundary this can defend -- such a process can already dlopen anything of
   # its own -- and there is no descriptor-passing interface to close it with.
-  local hl_now="" src_now=""
+  local hl_now="" hl_abi="" src_now=""
   hl_now=$(hyprland_commit)
+  hl_abi=$(hyprland_abi)
+  [[ -n $hl_abi ]] || fail "could not read Hyprland ABI (is hyprctl available?)"
   src_now=$(native_digest 2>/dev/null || true)
   src_now=$(sanitize_field "${src_now//$'\n'/}" 64)
-  so_attested_for "$hl_now" "$src_now" \
+  so_attested_for "$hl_now" "$src_now" "$hl_abi" \
     || fail "the built plugin no longer matches its build attestation; refusing to load it"
 
   local state=""

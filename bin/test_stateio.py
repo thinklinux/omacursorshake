@@ -373,7 +373,14 @@ PLUGIN_SO = "omacursorshake.so"
 PLUGIN_NAME = "omacursorshake"
 
 HL_0562 = "efb50993780079460b0cbed1363e2166a2de1d9f"
+# What `hyprctl -j version` reports as abiHash on Hyprland 0.56.2 with the
+# library set Omarchy 4.0.5 ships. The commit alone does not identify a build.
+HL_ABI = HL_0562 + "_aq_0.15_hu_0.14_hg_0.5_hc_0.1_hlg_0.6"
 BASH = "/usr/bin/bash"
+
+
+def hypr_version_json(abi: str = HL_ABI, commit: str = HL_0562) -> str:
+    return json.dumps({"commit": commit, "version": "0.56.2", "abiHash": abi})
 
 
 def backend_section(name: str) -> str:
@@ -391,8 +398,7 @@ def pipeline_version() -> int | None:
 HYPRCTL_STUB = (
     "#!/bin/sh\n"
     "case \"$*\" in\n"
-    "  *version*) printf '{\"commit\":\"%s\",\"version\":\"0.56.2\"}\\n' "
-    "efb50993780079460b0cbed1363e2166a2de1d9f ;;\n"
+    f"  *version*) printf '%s\\n' {shlex.quote(hypr_version_json())} ;;\n"
     "  *'plugin list'*) printf '[]\\n' ;;\n"
     "  *) printf 'ok\\n' ;;\n"
     "esac\n"
@@ -443,6 +449,7 @@ def seed_attested_so(state: Path, content: bytes = b"ELF-STUB\n", source_digest:
     stamp = {
         "pipeline": pv,
         "hyprland": HL_0562,
+        "abi": HL_ABI,
         "sourceDigest": source_digest or ("a" * 64),
         "soDigest": hashlib.sha256(content).hexdigest(),
     }
@@ -543,6 +550,7 @@ def test_backend_build_pipeline(tmp: Path) -> None:
     assert_true(so.stat().st_mode & 0o777 == 0o755, f"so mode {so.stat().st_mode:o}")
     stamp = json.loads((sdir / "built-for").read_text())
     assert_true(stamp["hyprland"] == HL_0562, f"stamp names the wrong Hyprland: {stamp}")
+    assert_true(stamp["abi"] == HL_ABI, f"stamp names the wrong ABI: {stamp}")
     assert_true("pluginRev" not in stamp, f"stamp still names an upstream pin: {stamp}")
     assert_true(stamp["pipeline"] == pipeline_version(), f"stamp pipeline: {stamp}")
     assert_true(
@@ -618,8 +626,7 @@ def test_hyprctl_output_is_byte_bounded(tmp: Path) -> None:
     body = (
         "#!/bin/sh\n"
         "case \"$*\" in\n"
-        "  *version*) printf '{\"commit\":\"%s\",\"version\":\"0.56.2\"}\\n' "
-        "efb50993780079460b0cbed1363e2166a2de1d9f ;;\n"
+        f"  *version*) printf '%s\\n' {shlex.quote(hypr_version_json())} ;;\n"
         "  *) yes '{\"name\":\"flood-omacursorshake\"}' ;;\n"
         "esac\n"
     )
@@ -721,7 +728,7 @@ def _load_stub(tmp: Path, listed_after: str, load_exit: int) -> Fake:
     body = (
         "#!/bin/sh\n"
         "case \"$*\" in\n"
-        "  *version*) printf '{\"commit\":\"efb50993780079460b0cbed1363e2166a2de1d9f\"}\\n' ;;\n"
+        f"  *version*) printf '%s\\n' {shlex.quote(hypr_version_json())} ;;\n"
         "  *'plugin list'*)\n"
         "    if [ -f \"$STUB_LOADED\" ]; then printf '%s\\n' \"$STUB_LISTED_AFTER\"\n"
         "    else printf '[]\\n'; fi ;;\n"
@@ -820,7 +827,7 @@ def test_mapped_so_is_claimed_as_ours(tmp: Path) -> None:
         "#!/bin/sh\n"
         f"echo \"$*\" >> {load_log}\n"
         "case \"$*\" in\n"
-        "  *version*) printf '{\"commit\":\"efb50993780079460b0cbed1363e2166a2de1d9f\"}\\n' ;;\n"
+        f"  *version*) printf '%s\\n' {shlex.quote(hypr_version_json())} ;;\n"
         f"  *instances*) printf '[{{\"instance\":\"test_instance\",\"pid\":{os.getpid()}}}]\\n' ;;\n"
         "  *'plugin list'*) printf '[{\"name\":\"omacursorshake\"}]\\n' ;;\n"
         "  *'plugin load'*) echo LOAD_ATTEMPTED >> \"$0.log\"; exit 1 ;;\n"
@@ -874,7 +881,7 @@ def test_cursor_theme_option_injection_refused(tmp: Path) -> None:
         "#!/bin/sh\n"
         f"echo \"$*\" >> {argv_log}\n"
         "case \"$*\" in\n"
-        "  *version*) printf '{\"commit\":\"efb50993780079460b0cbed1363e2166a2de1d9f\"}\\n' ;;\n"
+        f"  *version*) printf '%s\\n' {shlex.quote(hypr_version_json())} ;;\n"
         "  *'plugin list'*) printf '[{\"name\":\"omacursorshake\"}]\\n' ;;\n"
         "  *) printf 'ok\\n' ;;\n"
         "esac\n"
@@ -1030,12 +1037,40 @@ def test_legacy_stamp_forces_a_rebuild(tmp: Path) -> None:
     assert_true(stamp["pipeline"] == pipeline_version(), f"stamp not upgraded: {stamp}")
 
 
+def test_library_abi_change_forces_rebuild(tmp: Path) -> None:
+    """Same Hyprland commit, newer library ABI, must not reuse the .so.
+
+    Omarchy can bump aquamarine (0.14 -> 0.15) without changing the Hyprland
+    git commit. Hyprland then rejects the old .so as a version mismatch.
+    """
+    argv_log = tmp / "make-1.log"
+    fb = Fake(tmp, argv_log=argv_log)
+    proc = fb.run("ensure")
+    assert_true(proc.returncode == 0, f"first ensure failed: {proc.stderr!r}")
+    first = json.loads((fb.sdir / "built-for").read_text())
+    assert_true(first["abi"] == HL_ABI, first)
+
+    newer = HL_ABI.replace("_aq_0.15", "_aq_0.16")
+    (fb.stubs / "hyprctl").write_text(HYPRCTL_STUB.replace(HL_ABI, newer))
+    (fb.stubs / "hyprctl").chmod(0o755)
+    argv_log2 = tmp / "make-2.log"
+    (fb.stubs / "make").write_text(make_stub(argv_log2, "true"))
+    (fb.stubs / "make").chmod(0o755)
+    proc = fb.run("ensure")
+    assert_true(proc.returncode == 0, f"rebuild failed: {proc.stderr!r}")
+    assert_true(argv_log2.exists(), "library ABI change reused the old .so")
+    second = json.loads((fb.sdir / "built-for").read_text())
+    assert_true(second["abi"] == newer, second)
+    assert_true(second["hyprland"] == HL_0562, "commit should stay the same")
+
+
 def test_attestation_mismatch_blocks_reuse_and_load(tmp: Path) -> None:
     """Every field of the stamp gates both reuse and the dlopen."""
     for label, override, content in (
         ("tampered bytes", {}, b"REPLACED-AFTER-INSTALL\n"),
         ("stale pipeline", {"pipeline": 1}, None),
         ("wrong source digest", {"sourceDigest": "b" * 64}, None),
+        ("wrong abi", {"abi": HL_ABI.replace("_aq_0.15", "_aq_0.14")}, None),
     ):
         # A listing that lets an otherwise-legitimate load run to completion,
         # so the attestation is the only thing that can refuse it. With "[]"
@@ -1378,6 +1413,7 @@ def main() -> int:
         test_tree_digest_is_canonical,
         test_tree_digest_refuses_links_and_specials,
         test_native_change_forces_rebuild,
+        test_library_abi_change_forces_rebuild,
         test_backend_has_no_remote_fetch,
         test_legacy_stamp_forces_a_rebuild,
         test_attestation_mismatch_blocks_reuse_and_load,
